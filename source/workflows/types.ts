@@ -14,6 +14,7 @@ export type WorkflowNodeType =
 export type WorkflowRunStatus =
   | "pending"
   | "running"
+  | "paused"
   | "waiting_approval"
   | "passed"
   | "failed"
@@ -43,6 +44,12 @@ export interface WorkflowPolicies {
   costBudgetUsd?: number;
 }
 
+export interface WorkflowRetryPolicy {
+  maxAttempts?: number;
+  retryRunningAfterCrash?: boolean;
+  requireApprovalBeforeRetry?: boolean;
+}
+
 export interface WorkflowInputDefinition {
   type?: "string" | "number" | "boolean" | "object" | "array";
   default?: unknown;
@@ -70,6 +77,9 @@ interface WorkflowNodeBase {
   timeoutSeconds?: number;
   sandbox?: WorkflowPolicies["sandbox"];
   outputSchema?: Record<string, unknown>;
+  retrySafe?: boolean;
+  retryPolicy?: WorkflowRetryPolicy;
+  idempotencyKey?: string;
 }
 
 export interface WorkflowAgentNode extends WorkflowNodeBase {
@@ -188,6 +198,68 @@ export interface WorkflowNodeRun {
   approval?: WorkflowApprovalDecision;
   artifacts?: string[];
   skippedReason?: string;
+  dryRun?: boolean;
+  mocked?: boolean;
+}
+
+export interface WorkflowPendingNode {
+  id: string;
+  type: WorkflowNodeType;
+  dependsOn?: string[];
+}
+
+export interface WorkflowRunSummary {
+  run: WorkflowRun;
+  nodes: WorkflowNodeRun[];
+  pendingNodes: WorkflowPendingNode[];
+}
+
+export interface WorkflowMocks {
+  nodes?: Record<string, unknown>;
+  tools?: Record<string, unknown>;
+  agents?: Record<string, unknown>;
+  skills?: Record<string, unknown>;
+}
+
+export interface WorkflowRunOptions {
+  dryRun?: boolean;
+  force?: boolean;
+  mocks?: WorkflowMocks;
+  allowModelCalls?: boolean;
+  allowCommands?: boolean;
+  signal?: AbortSignal;
+  approveRetry?: boolean;
+}
+
+export interface WorkflowEvalFixture {
+  name: string;
+  description?: string;
+  inputs?: Record<string, unknown>;
+  options?: WorkflowRunOptions;
+  mocks?: WorkflowMocks;
+  expect: WorkflowEvalExpectations;
+}
+
+export interface WorkflowEvalExpectations {
+  status?: WorkflowRunStatus;
+  nodes?: Record<string, WorkflowNodeStatus>;
+  outputContains?: Record<string, string>;
+  outputMatches?: Record<string, string>;
+}
+
+export interface WorkflowEvalResult {
+  name: string;
+  passed: boolean;
+  runId: string;
+  failures: string[];
+}
+
+export interface WorkflowEvalSummary {
+  passed: boolean;
+  total: number;
+  passedCount: number;
+  failedCount: number;
+  results: WorkflowEvalResult[];
 }
 
 export interface WorkflowValidationIssue {

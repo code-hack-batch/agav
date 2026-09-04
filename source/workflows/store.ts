@@ -1,13 +1,16 @@
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getAgavDir } from "../config/config.js";
-import type { WorkflowNodeRun, WorkflowRun } from "./types.js";
+import type { WorkflowNodeRun, WorkflowPendingNode, WorkflowRun, WorkflowRunSummary } from "./types.js";
+import { flattenNodes } from "./validator.js";
 
 export interface WorkflowStoreOptions {
   rootDir?: string;
 }
+
+const TERMINAL_NODE_STATUSES = new Set(["passed", "failed", "skipped", "cancelled", "timed_out", "waiting_approval"]);
 
 export class WorkflowStore {
   readonly rootDir: string;
@@ -28,6 +31,14 @@ export class WorkflowStore {
     return join(this.runDir(runId), "nodes", `${safeNodeId(nodeId)}.json`);
   }
 
+  nodeAttemptsDir(runId: string, nodeId: string): string {
+    return join(this.runDir(runId), "nodes", `${safeNodeId(nodeId)}.attempts`);
+  }
+
+  nodeAttemptPath(runId: string, nodeId: string, attempt: number): string {
+    return join(this.nodeAttemptsDir(runId, nodeId), `${attempt}.json`);
+  }
+
   logPath(runId: string, nodeId: string): string {
     return join(this.runDir(runId), "logs", `${safeNodeId(nodeId)}.log`);
   }
@@ -40,8 +51,63 @@ export class WorkflowStore {
     return readJson<WorkflowRun>(join(this.runDir(runId), "run.json"));
   }
 
+  async listRuns(): Promise<WorkflowRun[]> {
+    if (!existsSync(this.rootDir)) return [];
+    const runs: WorkflowRun[] = [];
+    for (const entry of await readdir(this.rootDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const run = await this.loadRun(entry.name);
+      if (run) runs.push(run);
+    }
+    return runs.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  }
+
+  async getRunSummary(runId: string): Promise<WorkflowRunSummary | null> {
+    const run = await this.loadRun(runId);
+    if (!run) return null;
+    const nodesById = await this.loadNodes(runId);
+    const nodes = Object.values(nodesById).sort((a, b) => {
+      const aTime = Date.parse(a.startedAt ?? a.endedAt ?? "");
+      const bTime = Date.parse(b.startedAt ?? b.endedAt ?? "");
+      if (Number.isNaN(aTime) && Number.isNaN(bTime)) return a.id.localeCompare(b.id);
+      if (Number.isNaN(aTime)) return 1;
+      if (Number.isNaN(bTime)) return -1;
+      return aTime - bTime;
+    });
+    const pendingNodes: WorkflowPendingNode[] = flattenNodes(run.definition.nodes)
+      .filter((node) => !nodesById[node.id])
+      .map((node) => ({ id: node.id, type: node.type, dependsOn: node.dependsOn }));
+    return { run, nodes, pendingNodes };
+  }
+
   async saveNode(runId: string, node: WorkflowNodeRun): Promise<void> {
     await writeJsonAtomic(this.nodePath(runId, node.id), node);
+    if (TERMINAL_NODE_STATUSES.has(node.status)) {
+      await this.saveNodeAttempt(runId, node);
+    }
+  }
+
+  async saveNodeAttempt(runId: string, node: WorkflowNodeRun): Promise<void> {
+    await writeJsonAtomic(this.nodeAttemptPath(runId, node.id, node.attempt), node);
+  }
+
+  async listNodeAttempts(runId: string, nodeId: string): Promise<WorkflowNodeRun[]> {
+    const dir = this.nodeAttemptsDir(runId, nodeId);
+    if (!existsSync(dir)) return [];
+    const attempts: WorkflowNodeRun[] = [];
+    for (const entry of await readdir(dir)) {
+      if (!entry.endsWith(".json")) continue;
+      const attempt = await readJson<WorkflowNodeRun>(join(dir, entry));
+      if (attempt) attempts.push(attempt);
+    }
+    return attempts.sort((a, b) => a.attempt - b.attempt);
+  }
+
+  async nextNodeAttempt(runId: string, nodeId: string): Promise<number> {
+    const attempts = await this.listNodeAttempts(runId, nodeId);
+    const latestCheckpoint = await this.loadNode(runId, nodeId);
+    const maxAttempt = Math.max(0, ...attempts.map((attempt) => attempt.attempt), latestCheckpoint?.attempt ?? 0);
+    return maxAttempt + 1;
   }
 
   async loadNode(runId: string, nodeId: string): Promise<WorkflowNodeRun | null> {
@@ -63,8 +129,7 @@ export class WorkflowStore {
   async appendLog(runId: string, nodeId: string, line: string): Promise<void> {
     const path = this.logPath(runId, nodeId);
     await mkdir(dirname(path), { recursive: true });
-    const existing = await readFile(path, "utf8").catch(() => "");
-    await writeFile(path, existing + line + "\n");
+    await appendFile(path, line + "\n");
   }
 }
 
@@ -72,7 +137,16 @@ async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tmp, JSON.stringify(value, null, 2));
-  await rename(tmp, path);
+  try {
+    await rename(tmp, path);
+  } catch (error: any) {
+    if (process.platform === "win32" && (error?.code === "EPERM" || error?.code === "EACCES")) {
+      await rm(path, { force: true }).catch(() => {});
+      await rename(tmp, path);
+      return;
+    }
+    throw error;
+  }
 }
 
 async function readJson<T>(path: string): Promise<T | null> {

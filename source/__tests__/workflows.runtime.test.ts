@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockedFunction } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ import type { LLMProvider, StreamParams } from "../providers/types.js";
 import type { AgavConfig } from "../config/config.js";
 import type { AgentDefinition } from "../agents/types.js";
 import { WorkflowStore } from "../workflows/store.js";
-import { runWorkflow, resumeWorkflow } from "../workflows/runtime.js";
+import { runWorkflow, resumeWorkflow, type AgentExecutionOptions } from "../workflows/runtime.js";
 import { validateWorkflow } from "../workflows/validator.js";
 import type { WorkflowDefinition } from "../workflows/types.js";
 
@@ -55,8 +55,12 @@ describe("workflow runtime", () => {
   let store: WorkflowStore;
   let registry: ToolRegistry;
   let provider: MockProvider;
-  let loadAgent: ReturnType<typeof vi.fn>;
-  let executeAgent: ReturnType<typeof vi.fn>;
+  // Typed to the signatures WorkflowRuntimeDeps declares. An untyped vi.fn() mock is
+  // not assignable to those, and the mock helpers below would break.
+  let loadAgent: MockedFunction<(name: string) => Promise<AgentDefinition | null>>;
+  let executeAgent: MockedFunction<
+    (agent: AgentDefinition, task: string, options: AgentExecutionOptions) => Promise<string>
+  >;
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "agav-workflow-runtime-"));
@@ -64,7 +68,9 @@ describe("workflow runtime", () => {
     registry = new ToolRegistry();
     provider = new MockProvider();
     loadAgent = vi.fn(async (name: string) => makeAgent(name));
-    executeAgent = vi.fn(async (_agent: AgentDefinition, task: string) => `agent output: ${task}`);
+    executeAgent = vi.fn(async (_agent: AgentDefinition, task: string, _options: AgentExecutionOptions) =>
+      `agent output: ${task}`,
+    );
   });
 
   afterEach(async () => {

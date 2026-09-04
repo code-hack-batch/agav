@@ -14,11 +14,13 @@ import type {
   WorkflowApprovalDecision,
   WorkflowApprovalNode,
   WorkflowDefinition,
+  WorkflowMocks,
   WorkflowNodeDefinition,
   WorkflowNodeRun,
   WorkflowNodeStatus,
   WorkflowPromptNode,
   WorkflowRun,
+  WorkflowRunOptions,
   WorkflowRunStatus,
   WorkflowSkillNode,
   WorkflowTestNode,
@@ -27,9 +29,20 @@ import type {
 import { flattenNodes, validateWorkflow } from "./validator.js";
 
 const DEFAULT_MAX_CONCURRENCY = 4;
-const DEFAULT_MAX_ITERATIONS = 3;
-
 const ajv = new Ajv({ allErrors: true, strict: false });
+
+const DRY_RUN_SAFE_TOOLS = new Set([
+  "read_file",
+  "grep_search",
+  "find_files",
+  "list_directory",
+  "web_search",
+  "lsp_query",
+  "read_notebook",
+  "fetch_url",
+  "overview",
+  "run_tests",
+]);
 
 export interface AgentExecutionOptions {
   model?: string;
@@ -37,6 +50,8 @@ export interface AgentExecutionOptions {
   maxTokens?: number;
   permissionMode?: PermissionMode;
   sandbox?: string;
+  signal?: AbortSignal;
+  idempotencyKey?: string;
 }
 
 export interface WorkflowApprovalRequest {
@@ -56,12 +71,14 @@ export interface WorkflowRuntimeDeps {
   confirmTool?: (toolName: string, input: Record<string, unknown>) => Promise<ConfirmResult>;
   store?: WorkflowStore;
   now?: () => Date;
+  signal?: AbortSignal;
 }
 
 export async function runWorkflow(
   definition: WorkflowDefinition,
   inputs: Record<string, unknown>,
   deps: WorkflowRuntimeDeps,
+  options: WorkflowRunOptions = {},
 ): Promise<WorkflowRun> {
   const store = deps.store ?? new WorkflowStore();
   const resolvedInputs = resolveInputs(definition, inputs);
@@ -83,20 +100,29 @@ export async function runWorkflow(
     waitingApprovalNodeIds: [],
   };
   await store.saveRun(run);
-  return executeWorkflowRun(run, deps, store);
+  return executeWorkflowRun(run, deps, store, options);
 }
 
-export async function resumeWorkflow(runId: string, deps: WorkflowRuntimeDeps): Promise<WorkflowRun> {
+export async function resumeWorkflow(
+  runId: string,
+  deps: WorkflowRuntimeDeps,
+  options: WorkflowRunOptions = {},
+): Promise<WorkflowRun> {
   const store = deps.store ?? new WorkflowStore();
   const run = await store.loadRun(runId);
   if (!run) throw new Error(`Workflow run ${runId} not found`);
-  return executeWorkflowRun(run, deps, store);
+  if (run.status === "paused") run.status = "pending";
+  if (run.status === "cancelled" && !options.force) {
+    throw new Error(`Workflow run ${runId} is cancelled. Use force to resume it anyway.`);
+  }
+  return executeWorkflowRun(run, deps, store, options);
 }
 
 async function executeWorkflowRun(
   run: WorkflowRun,
   deps: WorkflowRuntimeDeps,
   store: WorkflowStore,
+  options: WorkflowRunOptions,
 ): Promise<WorkflowRun> {
   const validation = await validateWorkflow(run.definition, {
     hasTool: (name) => deps.toolRegistry.list().some((tool) => tool.schema.name === name),
@@ -105,6 +131,8 @@ async function executeWorkflowRun(
   if (!validation.ok) {
     return saveRunStatus(run, store, deps, "failed", validation.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"));
   }
+
+  if (activeSignal(deps, options)?.aborted) return saveRunStatus(run, store, deps, "paused", "Workflow paused before execution");
 
   run.status = "running";
   run.updatedAt = isoNow(deps);
@@ -118,8 +146,9 @@ async function executeWorkflowRun(
   const skippedThisRun = new Set<string>();
 
   while (true) {
+    if (activeSignal(deps, options)?.aborted) return saveRunStatus(run, store, deps, "paused", "Workflow paused by signal");
     const checkpoints = await store.loadNodes(run.id);
-    const ready = allNodes.filter((node) => isReady(node, checkpoints, completedThisRun, failedThisRun, skippedThisRun, nodeById, Boolean(deps.confirm)));
+    const ready = allNodes.filter((node) => isReady(node, checkpoints, completedThisRun, failedThisRun, skippedThisRun, nodeById, Boolean(deps.confirm) || Boolean(options.dryRun) || Boolean(options.approveRetry), Boolean(options.dryRun)));
 
     if (ready.length === 0) {
       const latest = await store.loadNodes(run.id);
@@ -141,8 +170,9 @@ async function executeWorkflowRun(
     await store.saveRun(run);
 
     await Promise.all(batch.map(async (node) => {
-      const result = await executeNode(run, node, deps, store).catch(async (error: unknown) => {
-        const failed = makeNodeRun(node, "failed", deps, { error: error instanceof Error ? error.message : String(error) });
+      const result = await executeNode(run, node, deps, store, options).catch(async (error: unknown) => {
+        const attempt = await store.nextNodeAttempt(run.id, node.id);
+        const failed = makeNodeRun(node, "failed", deps, { attempt, error: error instanceof Error ? error.message : String(error) });
         await store.saveNode(run.id, failed);
         return failed;
       });
@@ -180,19 +210,22 @@ function isReady(
   skippedThisRun: Set<string>,
   nodeById: Map<string, WorkflowNodeDefinition>,
   canResumeApproval: boolean,
+  dryRun: boolean,
 ): boolean {
   const existing = checkpoints[node.id];
   const hash = hashValue(node);
   if (existing?.status === "passed" && existing.nodeHash === hash) return false;
-  if (existing?.status === "waiting_approval") return canResumeApproval && node.type === "approval";
+  if (existing?.status === "skipped" && existing.nodeHash === hash) return false;
+  if (existing?.status === "waiting_approval") return canResumeApproval && (node.type === "approval" || existing.output === "retry_approval_required");
   if (existing?.status === "failed" && existing.nodeHash === hash) return false;
   if (completedThisRun.has(node.id) || failedThisRun.has(node.id) || skippedThisRun.has(node.id)) return false;
 
   for (const depId of node.dependsOn ?? []) {
     const dep = nodeById.get(depId);
     const depCheckpoint = checkpoints[depId];
-    if (depCheckpoint?.status !== "passed") return false;
-    if (dep && depCheckpoint.nodeHash !== hashValue(dep)) return false;
+    const satisfied = depCheckpoint?.status === "passed" || (dryRun && depCheckpoint?.status === "skipped");
+    if (!satisfied) return false;
+    if (dep && depCheckpoint?.nodeHash !== hashValue(dep)) return false;
   }
   return true;
 }
@@ -202,42 +235,82 @@ async function executeNode(
   node: WorkflowNodeDefinition,
   deps: WorkflowRuntimeDeps,
   store: WorkflowStore,
+  options: WorkflowRunOptions,
 ): Promise<WorkflowNodeRun> {
-  const started = makeNodeRun(node, "running", deps);
-  await store.saveNode(run.id, started);
-  await trace(store, run.id, node.id, { type: "node_started", nodeId: node.id, nodeType: node.type });
-
-  let result: WorkflowNodeRun;
-  switch (node.type) {
-    case "agent":
-      result = await executeAgentNode(run, node, deps, store);
-      break;
-    case "tool":
-      result = await executeToolNode(run, node, deps, store);
-      break;
-    case "test":
-      result = await executeTestNode(run, node, deps, store);
-      break;
-    case "approval":
-      result = await executeApprovalNode(run, node, deps, store);
-      break;
-    case "prompt":
-    case "reduce":
-      result = await executePromptNode(run, node, deps, store);
-      break;
-    case "skill":
-      result = await executeSkillNode(run, node, deps, store);
-      break;
-    case "parallel":
-    case "loop":
-      result = makeNodeRun(node, "failed", deps, { error: `${node.type} nodes are reserved but not implemented in this runtime slice` });
-      break;
-    default:
-      result = makeNodeRun(node, "failed", deps, { error: `Unsupported node type ${(node as WorkflowNodeDefinition).type}` });
+  const attempt = await store.nextNodeAttempt(run.id, node.id);
+  const existing = await store.loadNode(run.id, node.id);
+  let currentExisting = existing;
+  if (existing?.status === "waiting_approval" && existing.output === "retry_approval_required") {
+    if (!options.approveRetry) return existing;
+    await store.saveNode(run.id, { ...existing, status: "pending", skippedReason: "Retry approved" });
+    currentExisting = { ...existing, status: "pending", skippedReason: "Retry approved" };
+  }
+  if (shouldRequireRetryApproval(node, currentExisting, options)) {
+    const waiting = makeNodeRun(node, "waiting_approval", deps, {
+      attempt,
+      input: existing?.input,
+      output: "retry_approval_required",
+      summary: `Retry approval required for ${node.type} node ${node.id}`,
+      skippedReason: "retry approval required",
+    });
+    await store.saveNode(run.id, waiting);
+    return waiting;
+  }
+  if (activeSignal(deps, options)?.aborted) {
+    const cancelled = makeNodeRun(node, "cancelled", deps, { attempt, error: "Workflow paused by signal before node execution" });
+    await store.saveNode(run.id, cancelled);
+    return cancelled;
   }
 
+  const maxAttempts = node.retryPolicy?.maxAttempts;
+  if (maxAttempts !== undefined && attempt > maxAttempts) {
+    const failed = makeNodeRun(node, "failed", deps, {
+      attempt,
+      error: `Node exceeded retryPolicy.maxAttempts (${maxAttempts})`,
+    });
+    await store.saveNode(run.id, failed);
+    return failed;
+  }
+
+  const started = makeNodeRun(node, "running", deps, { attempt });
+  await store.saveNode(run.id, started);
+  await trace(store, run.id, node.id, { type: "node_started", nodeId: node.id, nodeType: node.type, dryRun: options.dryRun === true });
+
+  const mock = mockForNode(node, options.mocks);
+  if (mock !== undefined) {
+    const mocked = withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: mock.input, output: mock.output, summary: summarizeOutput(mock.output), mocked: true, dryRun: options.dryRun === true }));
+    await store.saveNode(run.id, mocked);
+    await trace(store, run.id, node.id, { type: "node_completed", nodeId: node.id, status: mocked.status, mocked: true });
+    return mocked;
+  }
+
+  const executeCurrentNode = async (): Promise<WorkflowNodeRun> => {
+    switch (node.type) {
+      case "agent":
+        return executeAgentNode(run, node, deps, store, options, attempt);
+      case "tool":
+        return executeToolNode(run, node, deps, store, options, attempt);
+      case "test":
+        return executeTestNode(run, node, deps, store, options, attempt);
+      case "approval":
+        return executeApprovalNode(run, node, deps, store, options, attempt);
+      case "prompt":
+      case "reduce":
+        return executePromptNode(run, node, deps, store, options, attempt);
+      case "skill":
+        return executeSkillNode(run, node, deps, store, options, attempt);
+      case "parallel":
+      case "loop":
+        return makeNodeRun(node, "failed", deps, { attempt, error: `${node.type} nodes are reserved but not implemented in this runtime slice` });
+      default:
+        return makeNodeRun(node, "failed", deps, { attempt, error: `Unsupported node type ${(node as WorkflowNodeDefinition).type}` });
+    }
+  };
+
+  const result = await withNodeTimeout(executeCurrentNode(), run, node, deps, attempt, options);
+
   await store.saveNode(run.id, result);
-  await trace(store, run.id, node.id, { type: "node_completed", nodeId: node.id, status: result.status });
+  await trace(store, run.id, node.id, { type: "node_completed", nodeId: node.id, status: result.status, dryRun: result.dryRun === true });
   return result;
 }
 
@@ -246,14 +319,17 @@ async function executeAgentNode(
   node: WorkflowAgentNode,
   deps: WorkflowRuntimeDeps,
   store: WorkflowStore,
+  options: WorkflowRunOptions,
+  attempt: number,
 ): Promise<WorkflowNodeRun> {
   const checkpoints = await store.loadNodes(run.id);
   const task = interpolateString(node.task, { inputs: run.inputs, nodes: checkpoints });
+  if (options.dryRun) return drySkipped(node, deps, task, `Dry run: skipped agent ${node.agent}`, attempt);
   const agent = await deps.loadAgent(node.agent);
-  if (!agent) return makeNodeRun(node, "failed", deps, { input: task, error: `Unknown agent: ${node.agent}` });
+  if (!agent) return makeNodeRun(node, "failed", deps, { attempt, input: task, error: `Unknown agent: ${node.agent}` });
 
-  const output = await deps.executeAgent(agent, task, executionOptions(run, node));
-  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { input: task, output, summary: summarizeOutput(output) }));
+  const output = await deps.executeAgent(agent, task, executionOptions(run, node, deps, options));
+  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: task, output, summary: summarizeOutput(output) }));
 }
 
 async function executeToolNode(
@@ -261,14 +337,17 @@ async function executeToolNode(
   node: WorkflowToolNode,
   deps: WorkflowRuntimeDeps,
   store: WorkflowStore,
+  options: WorkflowRunOptions,
+  attempt: number,
 ): Promise<WorkflowNodeRun> {
   const checkpoints = await store.loadNodes(run.id);
   const input = interpolateValue(node.input ?? {}, { inputs: run.inputs, nodes: checkpoints }) as Record<string, unknown>;
   if (node.sandbox && input["sandbox"] === undefined) input["sandbox"] = node.sandbox;
+  if (options.dryRun && !isDryRunSafeTool(deps, node.tool)) return drySkipped(node, deps, input, `Dry run: skipped tool ${node.tool}`, attempt);
   const result = await deps.toolRegistry.execute(node.tool, input);
   const output = normalizeToolResult(result);
   const status: WorkflowNodeStatus = result.isError ? "failed" : "passed";
-  return withValidatedOutput(node, makeNodeRun(node, status, deps, { input, output, summary: summarizeOutput(output), error: result.isError ? result.output : undefined }));
+  return withValidatedOutput(node, makeNodeRun(node, status, deps, { attempt, input, output, summary: summarizeOutput(output), error: result.isError ? result.output : undefined, dryRun: options.dryRun === true }));
 }
 
 async function executeTestNode(
@@ -276,11 +355,15 @@ async function executeTestNode(
   node: WorkflowTestNode,
   deps: WorkflowRuntimeDeps,
   store: WorkflowStore,
+  options: WorkflowRunOptions,
+  attempt: number,
 ): Promise<WorkflowNodeRun> {
   const checkpoints = await store.loadNodes(run.id);
   const failures: string[] = [];
+  const skipped: string[] = [];
 
   for (const assertion of node.assertions) {
+    if (activeSignal(deps, options)?.aborted) return makeNodeRun(node, "cancelled", deps, { attempt, error: "Workflow paused by signal during test node" });
     if (assertion.type === "output_contains") {
       const value = outputText(checkpoints[assertion.node]?.output);
       if (!value.includes(assertion.value)) failures.push(`${assertion.node} output does not contain ${assertion.value}`);
@@ -292,8 +375,12 @@ async function executeTestNode(
       if (!valid) failures.push(`${assertion.node} output failed schema: ${ajv.errorsText()}`);
     } else if (assertion.type === "tool_result") {
       const dep = checkpoints[assertion.node];
-      if (!dep || dep.status !== "passed") failures.push(`${assertion.node} did not pass`);
+      if (!dep || (dep.status !== "passed" && !(options.dryRun && dep.status === "skipped"))) failures.push(`${assertion.node} did not pass`);
     } else if (assertion.type === "command") {
+      if (options.dryRun && !options.allowCommands) {
+        skipped.push(`command skipped in dry-run: ${assertion.command}`);
+        continue;
+      }
       const command = interpolateString(assertion.command, { inputs: run.inputs, nodes: checkpoints });
       const input: Record<string, unknown> = { command };
       const sandbox = assertion.sandbox ?? node.sandbox ?? run.policies.sandbox;
@@ -308,9 +395,9 @@ async function executeTestNode(
   }
 
   if (failures.length > 0) {
-    return makeNodeRun(node, "failed", deps, { input: node.assertions, output: { failures }, summary: failures.join("\n"), error: failures.join("\n") });
+    return makeNodeRun(node, "failed", deps, { attempt, input: node.assertions, output: { failures, skipped }, summary: failures.join("\n"), error: failures.join("\n"), dryRun: options.dryRun === true });
   }
-  return makeNodeRun(node, "passed", deps, { input: node.assertions, output: { passed: true }, summary: "All assertions passed" });
+  return makeNodeRun(node, "passed", deps, { attempt, input: node.assertions, output: { passed: true, skipped }, summary: skipped.length > 0 ? `Assertions passed; ${skipped.length} command(s) skipped` : "All assertions passed", dryRun: options.dryRun === true });
 }
 
 async function executeApprovalNode(
@@ -318,18 +405,24 @@ async function executeApprovalNode(
   node: WorkflowApprovalNode,
   deps: WorkflowRuntimeDeps,
   store: WorkflowStore,
+  options: WorkflowRunOptions,
+  attempt: number,
 ): Promise<WorkflowNodeRun> {
   const checkpoints = await store.loadNodes(run.id);
   const prompt = interpolateString(node.prompt, { inputs: run.inputs, nodes: checkpoints });
+  if (options.dryRun) {
+    const approval: WorkflowApprovalDecision = { decision: "approved", approvedBy: "dry-run", decidedAt: isoNow(deps), note: "Synthetic dry-run approval" };
+    return makeNodeRun(node, "passed", deps, { attempt, input: prompt, output: approval, summary: "Dry run: synthetic approval", approval, dryRun: true });
+  }
   if (!deps.confirm) {
-    return makeNodeRun(node, "waiting_approval", deps, { input: prompt, summary: prompt });
+    return makeNodeRun(node, "waiting_approval", deps, { attempt, input: prompt, summary: prompt });
   }
   const decision = await deps.confirm({ run, node, prompt });
   const approval = { ...decision, decidedAt: decision.decidedAt ?? isoNow(deps) };
   if (approval.decision === "approved") {
-    return makeNodeRun(node, "passed", deps, { input: prompt, output: approval, summary: "Approved", approval });
+    return makeNodeRun(node, "passed", deps, { attempt, input: prompt, output: approval, summary: "Approved", approval });
   }
-  return makeNodeRun(node, "failed", deps, { input: prompt, output: approval, summary: "Denied", error: "Approval denied", approval });
+  return makeNodeRun(node, "failed", deps, { attempt, input: prompt, output: approval, summary: "Denied", error: "Approval denied", approval });
 }
 
 async function executePromptNode(
@@ -337,9 +430,12 @@ async function executePromptNode(
   node: WorkflowPromptNode,
   deps: WorkflowRuntimeDeps,
   store: WorkflowStore,
+  options: WorkflowRunOptions,
+  attempt: number,
 ): Promise<WorkflowNodeRun> {
   const checkpoints = await store.loadNodes(run.id);
   const prompt = interpolateString(node.prompt, { inputs: run.inputs, nodes: checkpoints });
+  if (options.dryRun && !options.allowModelCalls) return drySkipped(node, deps, prompt, "Dry run: skipped model prompt", attempt);
   const conversation = new ConversationState();
   conversation.addUserMessage(prompt);
   const registry = filterRegistry(deps.toolRegistry, node.allowedTools);
@@ -355,6 +451,7 @@ async function executePromptNode(
     systemPrompt: deps.config.systemPrompt,
     effort: node.effort ?? deps.config.effort,
     maxTokens: node.maxTokens ?? deps.config.maxTokens,
+    signal: activeSignal(deps, options),
     confirmTool: deps.confirmTool,
     permissionMode: run.policies.permissionMode ?? deps.config.permissionMode,
     maxIterations: 20,
@@ -371,7 +468,7 @@ async function executePromptNode(
   }
 
   const status: WorkflowNodeStatus = error ? "failed" : "passed";
-  return withValidatedOutput(node, makeNodeRun(node, status, deps, { input: prompt, output, usage, summary: summarizeOutput(output), error }));
+  return withValidatedOutput(node, makeNodeRun(node, status, deps, { attempt, input: prompt, output, usage, summary: summarizeOutput(output), error, dryRun: options.dryRun === true }));
 }
 
 async function executeSkillNode(
@@ -379,12 +476,15 @@ async function executeSkillNode(
   node: WorkflowSkillNode,
   deps: WorkflowRuntimeDeps,
   store: WorkflowStore,
+  options: WorkflowRunOptions,
+  attempt: number,
 ): Promise<WorkflowNodeRun> {
-  if (!deps.executeSkill) return makeNodeRun(node, "failed", deps, { error: "No skill executor configured" });
+  if (!deps.executeSkill) return makeNodeRun(node, "failed", deps, { attempt, error: "No skill executor configured" });
   const checkpoints = await store.loadNodes(run.id);
   const args = interpolateString(node.args ?? "", { inputs: run.inputs, nodes: checkpoints });
-  const output = await deps.executeSkill(node.skill, args, executionOptions(run, node));
-  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { input: args, output, summary: summarizeOutput(output) }));
+  if (options.dryRun) return drySkipped(node, deps, args, `Dry run: skipped skill ${node.skill}`, attempt);
+  const output = await deps.executeSkill(node.skill, args, executionOptions(run, node, deps, options));
+  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: args, output, summary: summarizeOutput(output) }));
 }
 
 function makeNodeRun(
@@ -407,7 +507,7 @@ function makeNodeRun(
 }
 
 function withValidatedOutput(node: WorkflowNodeDefinition, nodeRun: WorkflowNodeRun): WorkflowNodeRun {
-  if (!node.outputSchema || nodeRun.status !== "passed") return nodeRun;
+  if (!node.outputSchema || (nodeRun.status !== "passed" && nodeRun.status !== "skipped")) return nodeRun;
   let output = nodeRun.output;
   if (typeof output === "string") {
     try { output = JSON.parse(output); } catch {}
@@ -434,13 +534,15 @@ function resolveInputs(definition: WorkflowDefinition, supplied: Record<string, 
   return { ...out, ...supplied };
 }
 
-function executionOptions(run: WorkflowRun, node: WorkflowNodeDefinition): AgentExecutionOptions {
+function executionOptions(run: WorkflowRun, node: WorkflowNodeDefinition, deps: WorkflowRuntimeDeps, options: WorkflowRunOptions): AgentExecutionOptions {
   return {
     model: node.model,
     effort: node.effort,
     maxTokens: node.maxTokens,
     permissionMode: run.policies.permissionMode,
     sandbox: node.sandbox ?? run.policies.sandbox,
+    signal: activeSignal(deps, options),
+    idempotencyKey: node.idempotencyKey ?? `${run.id}:${node.id}`,
   };
 }
 
@@ -499,4 +601,92 @@ async function trace(store: WorkflowStore, runId: string, nodeId: string, event:
 
 function isoNow(deps: WorkflowRuntimeDeps): string {
   return (deps.now?.() ?? new Date()).toISOString();
+}
+
+function activeSignal(deps: WorkflowRuntimeDeps, options: WorkflowRunOptions): AbortSignal | undefined {
+  return options.signal ?? deps.signal;
+}
+
+async function withNodeTimeout(
+  promise: Promise<WorkflowNodeRun>,
+  run: WorkflowRun,
+  node: WorkflowNodeDefinition,
+  deps: WorkflowRuntimeDeps,
+  attempt: number,
+  options: WorkflowRunOptions,
+): Promise<WorkflowNodeRun> {
+  const timeoutSeconds = node.timeoutSeconds ?? run.policies.maxNodeRuntimeSeconds;
+  if (!timeoutSeconds || timeoutSeconds <= 0) return promise;
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<WorkflowNodeRun>((resolve) => {
+    timeout = setTimeout(() => {
+      resolve(makeNodeRun(node, "timed_out", deps, {
+        attempt,
+        error: `Node timed out after ${timeoutSeconds} seconds`,
+        dryRun: options.dryRun === true,
+      }));
+    }, timeoutSeconds * 1000);
+    timeout.unref?.();
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function mockForNode(node: WorkflowNodeDefinition, mocks?: WorkflowMocks): { input?: unknown; output: unknown } | undefined {
+  if (!mocks) return undefined;
+  const nodeMock = mocks.nodes?.[node.id];
+  if (nodeMock !== undefined) return normalizeMock(nodeMock);
+  if (node.type === "tool") {
+    const mock = mocks.tools?.[node.tool];
+    if (mock !== undefined) return normalizeMock(mock);
+  }
+  if (node.type === "agent") {
+    const mock = mocks.agents?.[node.agent];
+    if (mock !== undefined) return normalizeMock(mock);
+  }
+  if (node.type === "skill") {
+    const mock = mocks.skills?.[node.skill];
+    if (mock !== undefined) return normalizeMock(mock);
+  }
+  return undefined;
+}
+
+function normalizeMock(value: unknown): { input?: unknown; output: unknown } {
+  if (value && typeof value === "object" && "output" in value) {
+    const record = value as { input?: unknown; output: unknown };
+    return { input: record.input, output: record.output };
+  }
+  return { output: value };
+}
+
+function drySkipped(node: WorkflowNodeDefinition, deps: WorkflowRuntimeDeps, input: unknown, reason: string, attempt = 1): WorkflowNodeRun {
+  return makeNodeRun(node, "skipped", deps, { attempt,
+    input,
+    output: { dryRun: true, skipped: true, reason, plannedAction: input },
+    summary: reason,
+    skippedReason: reason,
+    dryRun: true,
+  });
+}
+
+function isDryRunSafeTool(deps: WorkflowRuntimeDeps, toolName: string): boolean {
+  if (DRY_RUN_SAFE_TOOLS.has(toolName)) return true;
+  const tool = deps.toolRegistry.list().find((entry) => entry.schema.name === toolName);
+  return tool?.schema.destructive === false && DRY_RUN_SAFE_TOOLS.has(toolName);
+}
+
+function shouldRequireRetryApproval(
+  node: WorkflowNodeDefinition,
+  existing: WorkflowNodeRun | null,
+  options: WorkflowRunOptions,
+): boolean {
+  if (options.dryRun || !existing || existing.status !== "running") return false;
+  if (node.retrySafe === true || node.retryPolicy?.retryRunningAfterCrash === true) return false;
+  if (node.retryPolicy?.retryRunningAfterCrash === false || node.retryPolicy?.requireApprovalBeforeRetry) return true;
+  return node.type === "agent" || node.type === "tool";
 }

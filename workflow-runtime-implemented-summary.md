@@ -1,0 +1,233 @@
+# Workflow Runtime Implemented Summary
+
+## Current implementation state
+
+The workflow runtime now supports:
+
+- workflow YAML/JSON loading;
+- workflow validation;
+- CLI and slash command execution;
+- checkpointed run/node state;
+- resume from checkpoints;
+- approval checkpoint decisions;
+- checkpoint/status visibility;
+- pending node visibility;
+- pause/cancel state;
+- retry/rewind checkpoint invalidation;
+- dry-run mode;
+- eval fixtures;
+- attempt history;
+- cooperative cancellation hooks;
+- node timeout checkpoints;
+- conservative retry approval for interrupted mutating/unknown agent and tool nodes;
+- basic `retryPolicy.maxAttempts` enforcement;
+- idempotency key propagation to A2A workflow agents.
+
+## Dry-run mode
+
+### Commands
+
+```bash
+agav workflows dry-run <workflow> [--input inputs.json]
+```
+
+```text
+/workflows dry-run <workflow>
+```
+
+### Runtime API
+
+```ts
+runWorkflow(definition, inputs, deps, { dryRun: true })
+```
+
+### Behavior
+
+| Node type | Dry-run behavior |
+| --- | --- |
+| `agent` | Skipped by default unless mocked. |
+| `tool` | Runs only for known safe/read-only tools; mutating/unknown tools are skipped. |
+| `approval` | Uses synthetic approval and passes. |
+| `prompt` / `reduce` | Skipped unless `allowModelCalls` is true. |
+| `skill` | Skipped by default unless mocked. |
+| `test` | Runs structural assertions; command assertions are skipped unless `allowCommands` is true. |
+
+Skipped nodes are checkpointed as:
+
+```json
+{
+  "status": "skipped",
+  "dryRun": true,
+  "output": {
+    "dryRun": true,
+    "skipped": true,
+    "reason": "...",
+    "plannedAction": "..."
+  }
+}
+```
+
+## Eval support
+
+### Eval directory layout
+
+```text
+.agav/workflows/my-flow.yaml
+.agav/workflows/my-flow.evals/
+  happy-path.json
+  approval-required.json
+```
+
+### Commands
+
+```bash
+agav workflows test <workflow>
+agav workflows test <workflow> --eval happy-path
+```
+
+```text
+/workflows test <workflow>
+```
+
+### APIs
+
+```ts
+loadWorkflowEvals(workflowPath)
+runWorkflowEval(workflow, fixture, deps)
+runWorkflowEvals(workflow, fixtures, deps)
+```
+
+### Expectations supported
+
+- final run status;
+- node statuses;
+- node output contains text;
+- node output matches regex.
+
+## Attempt history
+
+Each terminal node checkpoint is stored both as latest state and as immutable attempt history.
+
+```text
+~/.agav/workflow-runs/<run-id>/
+  nodes/<node-id>.json
+  nodes/<node-id>.attempts/
+    1.json
+    2.json
+```
+
+### APIs
+
+```ts
+store.saveNodeAttempt(runId, node)
+store.listNodeAttempts(runId, nodeId)
+store.nextNodeAttempt(runId, nodeId)
+```
+
+### Commands
+
+```bash
+agav workflows attempts <run-id> <node-id>
+```
+
+```text
+/workflows attempts <run-id> <node-id>
+```
+
+Retries increment attempts instead of overwriting the only historical record.
+
+## Cooperative cancellation and timeouts
+
+### Runtime options
+
+```ts
+runWorkflow(definition, inputs, deps, { signal })
+resumeWorkflow(runId, deps, { signal })
+```
+
+### Current behavior
+
+- If aborted before workflow execution, run is marked `paused`.
+- If aborted between scheduling loops, run is marked `paused`.
+- If aborted before a node starts, node is marked `cancelled`.
+- Test nodes check cancellation between assertions.
+- Prompt/reduce nodes pass the signal into `runAgentLoop()`.
+- Agent nodes pass signal through `AgentExecutionOptions` for future executor-level support.
+- Node timeout creates a `timed_out` checkpoint.
+
+### Remaining cancellation limitation
+
+Cancellation is cooperative. If an underlying tool or external agent ignores cancellation, the runtime can checkpoint timeout/cancel state but cannot forcibly stop that underlying operation yet.
+
+## Retry and idempotency safeguards
+
+Implemented safeguards:
+
+- interrupted `agent` and `tool` nodes require retry approval by default;
+- `retrySafe: true` or `retryPolicy.retryRunningAfterCrash: true` allows automatic retry;
+- `retryPolicy.retryRunningAfterCrash: false` and `retryPolicy.requireApprovalBeforeRetry: true` force approval;
+- `retryPolicy.maxAttempts` is enforced before execution;
+- workflow-generated idempotency key defaults to `${run.id}:${node.id}`;
+- explicit `idempotencyKey` on the node overrides the default;
+- idempotency key is passed to A2A agents in the invocation context.
+
+Remaining retry/idempotency work:
+
+- native agent tools do not yet receive idempotency metadata directly;
+- no exponential backoff policy yet;
+- no per-tool mutability inference beyond tool schema and node type defaults;
+- no CLI command yet for `resume --approve-retry` in slash help text beyond supported option handling.
+
+## Tests added
+
+| Test file | Coverage |
+| --- | --- |
+| `source/__tests__/workflows.dry-run-evals.test.ts` | Dry-run skipping, safe tool behavior, mocks, eval fixture loading/running. |
+| `source/__tests__/workflows.attempts-cancellation.test.ts` | Attempt history, retry attempt increments, timeout checkpoint, pre-abort pause. |
+| `source/__tests__/workflows.loader.test.ts` | Workflow YAML/JSON loading/listing. |
+| `source/__tests__/workflows.control.test.ts` | Run control, approval decisions, pending nodes, retry invalidation. |
+| `source/__tests__/commands.workflows.test.ts` | Slash command checkpoint formatting. |
+| `source/__tests__/workflows.runtime.test.ts` | Core runtime execution/resume. |
+
+## Verification
+
+Clean verification commands:
+
+```bash
+pnpm exec tsc --noEmit
+```
+
+```bash
+pnpm vitest run source/__tests__/workflows.attempts-cancellation.test.ts source/__tests__/workflows.dry-run-evals.test.ts source/__tests__/workflows.runtime.test.ts source/__tests__/workflows.control.test.ts source/__tests__/workflows.loader.test.ts source/__tests__/commands.workflows.test.ts
+```
+
+## Recommended next two enhancements
+
+### 1. Observability and metrics dashboard
+
+Next highest value because dry-runs, evals, attempts, and checkpointed runs now produce operational data.
+
+Add:
+
+- attempt counts in run summaries;
+- node durations;
+- token usage totals;
+- dry-run/mocked markers;
+- recent logs in status output;
+- richer `/workflows status`;
+- eventually `/ops` or `/runs` dashboard.
+
+### 2. Configurable retry/backoff/idempotency enforcement
+
+Next safety-critical enhancement before EziSign or scheduled mutating workflows.
+
+Enforce:
+
+- `retryPolicy.maxAttempts`;
+- `retryPolicy.retryRunningAfterCrash`;
+- `retryPolicy.requireApprovalBeforeRetry`;
+- `retrySafe`;
+- `idempotencyKey`;
+- conservative defaults for mutating tools and external agents.
+
+This should happen before workflow scheduling or real business integrations.
