@@ -99,7 +99,7 @@ const nativeCopy = (text: string): boolean => {
 			return true;
 		}
 
-		execFile(clipboardCmd.cmd, clipboardCmd.args, { input: Buffer.from(text) }, () => {});
+		execFile(clipboardCmd.cmd, clipboardCmd.args, { input: text }, () => {});
 		return true;
 	} catch {
 		return false;
