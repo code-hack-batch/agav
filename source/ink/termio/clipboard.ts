@@ -3,7 +3,7 @@
 // no native tool is available.
 
 import { platform } from "node:os";
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 
 /** Build the OSC 52 escape sequence that sets the system clipboard. */
 export const osc52Copy = (text: string): string => {
@@ -95,21 +95,11 @@ const nativeCopy = (text: string): boolean => {
 			// to avoid any quoting or encoding issues on the command line.
 			const utf16 = Buffer.from(text, "utf16le").toString("base64");
 			const ps = `[System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${utf16}')) | Set-Clipboard`;
-			const child = spawn("powershell", ["-NoProfile", "-Command", ps], {
-				stdio: ["ignore", "ignore", "ignore"],
-				windowsHide: true,
-			});
-			child.on("error", () => {});
+			execFile("powershell", ["-NoProfile", "-Command", ps], { windowsHide: true }, () => {});
 			return true;
 		}
 
-		const child = spawn(clipboardCmd.cmd, clipboardCmd.args, {
-			stdio: ["pipe", "ignore", "ignore"],
-		});
-		child.on("error", () => {}); // swallow unexpected runtime errors
-		child.stdin?.on("error", () => {}); // guard against EPIPE
-		child.stdin?.write(text);
-		child.stdin?.end();
+		execFile(clipboardCmd.cmd, clipboardCmd.args, { input: Buffer.from(text) }, () => {});
 		return true;
 	} catch {
 		return false;
