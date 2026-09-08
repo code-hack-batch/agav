@@ -33,7 +33,7 @@ Windows PowerShell:
 irm https://www.agav.dev/install.ps1 | iex
 ```
 
-Download binaries or pre-releases from [Releases](../../releases). See [docs.agav.dev/docs/getting-started/installation](https://docs.agav.dev/docs/getting-started/installation) for Windows cmd, `--beta`, upgrade and uninstall.
+Download binaries or pre-releases from [Releases](../../releases). See [docs.agav.dev/getting-started/installation](https://docs.agav.dev/getting-started/installation) for Windows cmd, `--beta`, upgrade and uninstall.
 
 ## Run
 
@@ -112,11 +112,11 @@ Ask in plain English to summarize docs, analyze a CSV, generate a deck outline o
 
 ## Quick links
 
-* [Quick start](https://docs.agav.dev/docs/getting-started/quick-start)
+* [Quick start](https://docs.agav.dev/getting-started/quick-start)
 * [CLI reference](https://docs.agav.dev/reference/cli)
-* [Tools, skills & agents](https://docs.agav.dev/docs/features)
-* [Workflows & automation](https://docs.agav.dev/docs/workflows)
-* [Changelog](https://docs.agav.dev/changelog)
+* [Tools, skills & agents](https://docs.agav.dev/features)
+* [Workflows & automation](https://docs.agav.dev/workflows)
+* [Changelog](https://github.com/prapaa-ai/agav/releases)
 
 ## Community
 
