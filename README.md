@@ -98,7 +98,7 @@ Ask in plain English to summarize docs, analyze a CSV, generate a deck outline o
 
 ## Proof
 
-* **Terminal-Bench 2.1** — 84.7% [377/445 trials ±0.84%](https://github.com/harbor-framework/terminal-bench-2-1/pull/225), top of public board.
+* **Terminal-Bench 2.1** — 84.7% [377/445 trials ±0.84%](https://github.com/harbor-framework/terminal-bench-2-1/pull/225), top of public board.(PR under review)
 * **SWE-bench-Live Lite** — 62.0% [186/300](https://github.com/SWE-bench-Live/submission/blob/main/submissions/lite/agav/gpt-5.5), #2 on the board.
 
 ## Highlights
