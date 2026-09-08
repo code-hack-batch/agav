@@ -65,13 +65,19 @@ agav update
 
 ## Why Agav
 
-**Real repository work, not chat about code.** Agav uses built-in tools to read, search, edit, run commands, test and undo — all scoped to the repo you run it in.
+Today, the most powerful AI tools are controlled by a handful of companies. They choose which models you use, where your data goes, and how much you pay. If they change the rules tomorrow, you have no choice but to follow.
 
-**Terminal-first, no compromises.** Full IDE power with terminal speed. Sessions resume, branch, and export. Plans persist across `/compact`.
+We’re building the alternative — an AI that works for you, runs on your terms, and belongs to no one.
 
-**Autonomous and safe.** Plans are created and tracked automatically. Commands run sandboxed on macOS/Linux. Per-tool permissions, human-in-the-loop for destructive actions, and `/undo` for the last file change.
+**You own it.** Apache 2.0 open source. No lock-in, no hidden telemetry, auditable code.
 
-**Open and private.** 7 providers — Anthropic, OpenAI, OpenRouter, NVIDIA NIM, Gemini, Vertex AI, Ollama. Encrypted API keys, local models, and an open skills & agents ecosystem.
+**You choose the brain.** 7 providers — Anthropic, OpenAI, OpenRouter, NVIDIA NIM, Gemini, Vertex AI, Ollama. Switch models mid-session with `/model`, run local with Ollama, or route via OpenRouter.
+
+**You control the data.** Encrypted API keys, local-first option, per-tool permissions, and sandboxed commands on macOS/Linux.
+
+**Real work, not chat.** Built-in tools read, search, edit, test and undo inside your repo. Plans are tracked, sessions survive, and `/undo` keeps you safe.
+
+**Autonomous and verifiable.** Plans are created and tracked automatically, human-in-the-loop for destructive actions, and non-interactive `agav run` for CI with JSON Schema output.
 
 ## Vision
 
@@ -87,7 +93,7 @@ Refactor, debug, run Terminal-Bench level tasks, and audit repos with scriptable
 **Teams & Ops**
 Schedule, watch and loop tasks. Non-interactive mode with per-tool permissions for CI. Memory and planning that survive session restarts.
 
-**Non-technical users**
+**Non-coders**
 Ask in plain English to summarize docs, analyze a CSV, generate a deck outline or draft emails — private, no code required.
 
 ## Proof
