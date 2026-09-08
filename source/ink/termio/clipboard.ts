@@ -95,11 +95,11 @@ const nativeCopy = (text: string): boolean => {
 			// to avoid any quoting or encoding issues on the command line.
 			const utf16 = Buffer.from(text, "utf16le").toString("base64");
 			const ps = `[System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${utf16}')) | Set-Clipboard`;
-			execFile("powershell", ["-NoProfile", "-Command", ps], { windowsHide: true }, () => {});
+			execFile("powershell", ["-NoProfile", "-Command", ps], { windowsHide: true } as any, () => {});
 			return true;
 		}
 
-		execFile(clipboardCmd.cmd, clipboardCmd.args, { input: text }, () => {});
+		execFile(clipboardCmd.cmd, clipboardCmd.args, { input: Buffer.from(text) } as any, () => {});
 		return true;
 	} catch {
 		return false;
