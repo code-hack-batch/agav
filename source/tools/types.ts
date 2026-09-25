@@ -21,6 +21,12 @@ export interface ToolResult {
 export interface ToolContext {
   env?: Record<string, string>;
   signal?: AbortSignal;
+  /**
+   * Stable key for the current logical operation, supplied by a workflow node so
+   * retries and resumes can deduplicate side effects. Undefined outside workflow
+   * execution.
+   */
+  idempotencyKey?: string;
 }
 
 export interface ToolDefinition {

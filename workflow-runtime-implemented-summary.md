@@ -139,6 +139,63 @@ reused. Only a `running` (interrupted) checkpoint is re-executed.
 - `stopWhen.node` must name a body node; the validator rejects it otherwise.
 - `maxIterations` must be a positive integer.
 
+## Retry hardening
+
+Retry policy is centralized in `source/workflows/retry.ts`.
+
+```ts
+resolveRetryDecision(ctx): RetryDecision   // execute | wait_approval | exhausted | reuse
+effectiveMaxAttempts(node): number
+effectiveCrashAttempts(node): number
+backoffDelayMs(policy, attempt): number
+shouldRetryNode(node): boolean
+```
+
+### Two independent budgets
+
+| Budget | Governs | Default |
+| --- | --- | --- |
+| `effectiveMaxAttempts` | retry-on-error | `1` (no automatic retry) |
+| `effectiveCrashAttempts` | recovery of an interrupted (`running`) node | `2` |
+
+Crash recovery stays possible even when failure retries are disabled, so work
+in progress when the process died can still finish on resume. A failed external
+call is never silently re-executed.
+
+### Policy fields
+
+```ts
+retryPolicy: {
+  maxAttempts,                 // total attempts, default 1
+  retryOnFailure,              // opt-in automatic retry on error
+  retryRunningAfterCrash,      // may an interrupted node retry
+  requireApprovalBeforeRetry,  // force approval before retry
+  initialDelayMs,              // backoff base
+  backoffMultiplier,           // growth factor, default 2
+  maxDelayMs,                  // backoff cap, default 60000
+  nonRetryableStatuses,        // never retry these statuses
+}
+retrySafe: boolean             // permits crash retry without approval
+```
+
+### Runtime behavior
+
+- The scheduler re-admits failed/timed-out nodes that still have retry budget.
+- Backoff is applied between scheduler passes and is abort-aware.
+- `stopOnFailure` only trips on failures that are actually terminal.
+- `pending` (an operator reset via retry/rewind) always executes, regardless of
+  the automatic retry budget.
+- Approval nodes are exempt from the retry policy so a pending decision is always
+  re-surfaced.
+- A progress guard fails the run after 3 consecutive no-progress scheduler
+  passes instead of spinning.
+
+### Idempotency
+
+`ToolContext.idempotencyKey` is now populated for tools invoked by native
+agents, and A2A agents receive the key in their invocation context. The default
+key is `${run.id}:${node.id}` and can be overridden per node via `idempotencyKey`.
+
 ## Observability
 
 Added `source/workflows/metrics.ts`, which derives a metrics rollup from a run summary.
@@ -354,6 +411,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.retry-hardening.test.ts` | Retry decision table, attempt budgets, backoff math, automatic retry-until-success, exhaustion, operator reset after exhaustion, timeout retry, dry-run safety. |
 | `source/__tests__/workflows.observability.test.ts` | Node status counts, token aggregation, attempt/retried tracking, dry-run/mock flags, per-type and slowest-node timing, duration formatting, log reading, node timing regression. |
 | `source/__tests__/workflows.loop.test.ts` | Loop early exit, ordering, per-iteration aggregation, exhaustion, fail-fast, scoped checkpoints, resume, validation. |
 | `source/__tests__/workflows.dry-run-evals.test.ts` | Dry-run skipping, safe tool behavior, mocks, eval fixture loading/running. |
@@ -377,32 +435,27 @@ pnpm vitest run source/__tests__/workflows.attempts-cancellation.test.ts source/
 
 ## Recommended next two enhancements
 
-### 1. Configurable retry/backoff/idempotency enforcement
-
-Next safety-critical enhancement before EziSign or scheduled mutating workflows.
-Attempt history and observability now make retry behaviour measurable.
-
-Enforce:
-
-- `retryPolicy.maxAttempts` (already enforced);
-- exponential backoff between attempts;
-- `retryPolicy.retryRunningAfterCrash`;
-- `retryPolicy.requireApprovalBeforeRetry`;
-- `retrySafe`;
-- idempotency key reaching native agent tools;
-- retry metrics surfaced in evals.
-
-### 2. Workflow scheduling
+### 1. Workflow scheduling
 
 ```bash
 agav workflows schedule add <workflow> "0 9 * * 1-5"
 ```
 
 Triggers a versioned workflow run rather than a raw prompt, with run history
-visible through the existing observability surface.
+visible through the existing observability surface. Safe to build now that
+retry and crash recovery are hardened.
+
+### 2. Token and cost budget enforcement
+
+`WorkflowPolicies.tokenBudget` and `costBudgetUsd` are declared but never
+checked. Enforce them against the usage metrics the observability layer
+already computes, so a runaway agent node stops the run instead of silently
+overspending.
 
 ## Known gaps
 
-- run-level `tokenBudget` / `costBudgetUsd` policies are declared but not enforced;
-- agent-node token usage is not captured (only `prompt`/`reduce` nodes report it);
-- metrics are computed on demand, not persisted or aggregated across runs.
+- agent-node token usage is not captured (only `prompt`/`reduce` nodes report
+  it), so budget enforcement would initially cover prompt/reduce nodes only;
+- metrics are computed on demand, not persisted or aggregated across runs;
+- cancellation remains cooperative: a tool that ignores `AbortSignal` keeps
+  running even after its node is checkpointed as cancelled or timed out.

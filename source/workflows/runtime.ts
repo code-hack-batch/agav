@@ -28,9 +28,11 @@ import type {
   WorkflowTestNode,
   WorkflowToolNode,
 } from "./types.js";
+import { backoffDelayMs, effectiveMaxAttempts, resolveRetryDecision, shouldRetryNode } from "./retry.js";
 import { validateWorkflow } from "./validator.js";
 
 const DEFAULT_MAX_CONCURRENCY = 4;
+const MAX_STUCK_SCHEDULER_PASSES = 3;
 const DEFAULT_MAX_ITERATIONS = 3;
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -150,11 +152,32 @@ async function executeWorkflowRun(
   const failedThisRun = new Set<string>();
   const waitingThisRun = new Set<string>();
   const skippedThisRun = new Set<string>();
+  let currentCheckpoints: Record<string, WorkflowNodeRun> = {};
+  const lastAttemptByNode = new Map<string, number>();
+
+  let schedulerPasses = 0;
+  let lastProgressSignature = "";
 
   while (true) {
     if (activeSignal(deps, options)?.aborted) return saveRunStatus(run, store, deps, "paused", "Workflow paused by signal");
+
+    // A full pass that changes no node state means the scheduler cannot make
+    // further progress. Bail out instead of spinning forever.
+    const progressSignature = JSON.stringify(
+      allNodes.map((node) => `${node.id}:${(currentCheckpoints[node.id]?.status ?? "none")}:${currentCheckpoints[node.id]?.attempt ?? 0}`),
+    );
+    if (progressSignature === lastProgressSignature) {
+      schedulerPasses++;
+      if (schedulerPasses >= MAX_STUCK_SCHEDULER_PASSES) {
+        return saveRunStatus(run, store, deps, "failed", "Workflow scheduler made no progress");
+      }
+    } else {
+      schedulerPasses = 0;
+      lastProgressSignature = progressSignature;
+    }
     const checkpoints = await store.loadNodes(run.id);
-    const ready = allNodes.filter((node) => isReady(node, checkpoints, completedThisRun, failedThisRun, skippedThisRun, nodeById, Boolean(deps.confirm) || Boolean(options.dryRun) || Boolean(options.approveRetry), Boolean(options.dryRun)));
+    currentCheckpoints = checkpoints;
+    const ready = allNodes.filter((node) => isReady(node, checkpoints, completedThisRun, failedThisRun, skippedThisRun, lastAttemptByNode, nodeById, Boolean(deps.confirm) || Boolean(options.dryRun) || Boolean(options.approveRetry), Boolean(options.dryRun)));
 
     if (ready.length === 0) {
       const latest = await store.loadNodes(run.id);
@@ -182,11 +205,21 @@ async function executeWorkflowRun(
         await store.saveNode(run.id, failed);
         return failed;
       });
-      if (result.status === "passed") completedThisRun.add(node.id);
-      if (result.status === "failed" || result.status === "timed_out") failedThisRun.add(node.id);
+      lastAttemptByNode.set(node.id, result.attempt);
+      if (result.status === "passed") {
+        completedThisRun.add(node.id);
+        failedThisRun.delete(node.id);
+      }
+      if (result.status === "failed" || result.status === "timed_out" || result.status === "cancelled") failedThisRun.add(node.id);
       if (result.status === "waiting_approval") waitingThisRun.add(node.id);
       if (result.status === "skipped") skippedThisRun.add(node.id);
     }));
+
+    const backoff = computeBackoffDelayMs(allNodes, lastAttemptByNode);
+    if (backoff > 0) {
+      if (activeSignal(deps, options)?.aborted) return saveRunStatus(run, store, deps, "paused", "Workflow paused by signal");
+      await sleep(backoff, activeSignal(deps, options));
+    }
 
     if (waitingThisRun.size > 0) {
       const terminal = summarizeTerminalState(allNodes, await store.loadNodes(run.id));
@@ -197,7 +230,7 @@ async function executeWorkflowRun(
       return saveRunStatus(run, store, deps, "waiting_approval");
     }
 
-    if ((run.policies.stopOnFailure ?? true) && failedThisRun.size > 0) {
+    if ((run.policies.stopOnFailure ?? true) && [...failedThisRun].some((id) => isTerminalFailure(allNodes, id))) {
       const terminal = summarizeTerminalState(allNodes, await store.loadNodes(run.id));
       run.completedNodeIds = terminal.completed;
       run.failedNodeIds = terminal.failed;
@@ -214,6 +247,7 @@ function isReady(
   completedThisRun: Set<string>,
   failedThisRun: Set<string>,
   skippedThisRun: Set<string>,
+  lastAttemptByNode: Map<string, number>,
   nodeById: Map<string, WorkflowNodeDefinition>,
   canResumeApproval: boolean,
   dryRun: boolean,
@@ -223,8 +257,22 @@ function isReady(
   if (existing?.status === "passed" && existing.nodeHash === hash) return false;
   if (existing?.status === "skipped" && existing.nodeHash === hash) return false;
   if (existing?.status === "waiting_approval") return canResumeApproval && (node.type === "approval" || existing.output === "retry_approval_required");
-  if (existing?.status === "failed" && existing.nodeHash === hash) return false;
-  if (completedThisRun.has(node.id) || failedThisRun.has(node.id) || skippedThisRun.has(node.id)) return false;
+  if (existing?.status === "pending") return true;
+  if (existing?.status === "failed" || existing?.status === "timed_out" || existing?.status === "cancelled") {
+    if (existing.nodeHash !== hash) return false;
+    // A node that failed but still has retry budget goes back into the ready
+    // set so the run loop can attempt it again.
+    if (!shouldRetryNode(node)) return false;
+    const nextAttempt = (existing.attempt ?? 0) + 1;
+    if (nextAttempt > effectiveMaxAttempts(node)) return false;
+    return true;
+  }
+  if (completedThisRun.has(node.id) || skippedThisRun.has(node.id)) return false;
+  if (failedThisRun.has(node.id)) {
+    const lastAttempt = lastAttemptByNode.get(node.id) ?? 0;
+    if (lastAttempt + 1 > effectiveMaxAttempts(node)) return false;
+    if (!shouldRetryNode(node)) return false;
+  }
 
   for (const depId of node.dependsOn ?? []) {
     const dep = nodeById.get(depId);
@@ -245,37 +293,45 @@ async function executeNode(
 ): Promise<WorkflowNodeRun> {
   const attempt = await store.nextNodeAttempt(run.id, node.id);
   const existing = await store.loadNode(run.id, node.id);
-  let currentExisting = existing;
-  if (existing?.status === "waiting_approval" && existing.output === "retry_approval_required") {
-    if (!options.approveRetry) return existing;
-    await store.saveNode(run.id, { ...existing, status: "pending", skippedReason: "Retry approved" });
-    currentExisting = { ...existing, status: "pending", skippedReason: "Retry approved" };
+
+  const decision = resolveRetryDecision({
+    node,
+    attempt,
+    previous: existing,
+    approveRetry: options.approveRetry === true,
+    dryRun: options.dryRun === true,
+  });
+
+  if (decision.action === "reuse") {
+    // Nothing to redo: the existing checkpoint already represents this node.
+    return existing as WorkflowNodeRun;
   }
-  if (shouldRequireRetryApproval(node, currentExisting, options)) {
+
+  if (decision.action === "wait_approval") {
     const waiting = makeNodeRun(node, "waiting_approval", deps, {
       attempt,
       input: existing?.input,
       output: "retry_approval_required",
-      summary: `Retry approval required for ${node.type} node ${node.id}`,
+      summary: decision.reason,
       skippedReason: "retry approval required",
     });
     await store.saveNode(run.id, waiting);
     return waiting;
   }
+
+  if (decision.action === "exhausted") {
+    const failed = makeNodeRun(node, "failed", deps, {
+      attempt,
+      error: decision.reason,
+    });
+    await store.saveNode(run.id, failed);
+    return failed;
+  }
+
   if (activeSignal(deps, options)?.aborted) {
     const cancelled = makeNodeRun(node, "cancelled", deps, { attempt, error: "Workflow paused by signal before node execution" });
     await store.saveNode(run.id, cancelled);
     return cancelled;
-  }
-
-  const maxAttempts = node.retryPolicy?.maxAttempts;
-  if (maxAttempts !== undefined && attempt > maxAttempts) {
-    const failed = makeNodeRun(node, "failed", deps, {
-      attempt,
-      error: `Node exceeded retryPolicy.maxAttempts (${maxAttempts})`,
-    });
-    await store.saveNode(run.id, failed);
-    return failed;
   }
 
   const started = makeNodeRun(node, "running", deps, { attempt });
@@ -818,6 +874,46 @@ async function executeLoopBodyNode(
   return executeNode(run, scopedLoopNode(child, iteration), deps, store, options);
 }
 
+function isTerminalFailure(nodes: WorkflowNodeDefinition[], nodeId: string): boolean {
+  const node = nodes.find((entry) => entry.id === nodeId);
+  if (!node) return true;
+  return !shouldRetryNode(node);
+}
+
+function computeBackoffDelayMs(nodes: WorkflowNodeDefinition[], lastAttemptByNode: Map<string, number>): number {
+  let delay = 0;
+  for (const node of nodes) {
+    const attempt = lastAttemptByNode.get(node.id);
+    if (attempt === undefined) continue;
+    if (!shouldRetryNode(node)) continue;
+    if (attempt >= effectiveMaxAttempts(node)) continue;
+    delay = Math.max(delay, backoffDelayMs(node.retryPolicy, attempt));
+  }
+  return delay;
+}
+
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    if (signal) {
+      if (signal.aborted) {
+        clearTimeout(timer);
+        resolve();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
 function makeNodeRun(
   node: WorkflowNodeDefinition,
   status: WorkflowNodeStatus,
@@ -1011,13 +1107,3 @@ function isDryRunSafeTool(deps: WorkflowRuntimeDeps, toolName: string): boolean 
   return tool?.schema.destructive === false && DRY_RUN_SAFE_TOOLS.has(toolName);
 }
 
-function shouldRequireRetryApproval(
-  node: WorkflowNodeDefinition,
-  existing: WorkflowNodeRun | null,
-  options: WorkflowRunOptions,
-): boolean {
-  if (options.dryRun || !existing || existing.status !== "running") return false;
-  if (node.retrySafe === true || node.retryPolicy?.retryRunningAfterCrash === true) return false;
-  if (node.retryPolicy?.retryRunningAfterCrash === false || node.retryPolicy?.requireApprovalBeforeRetry) return true;
-  return node.type === "agent" || node.type === "tool";
-}

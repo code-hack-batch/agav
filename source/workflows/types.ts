@@ -45,9 +45,22 @@ export interface WorkflowPolicies {
 }
 
 export interface WorkflowRetryPolicy {
+  /** Total attempts allowed, including the first. Default 1 (no retry). */
   maxAttempts?: number;
+  /** Whether an interrupted (`running`) node may be retried automatically after a crash. */
   retryRunningAfterCrash?: boolean;
+  /** Requires explicit approval before retrying an interrupted node. */
   requireApprovalBeforeRetry?: boolean;
+  /** Whether a node that returned an error may be retried automatically. */
+  retryOnFailure?: boolean;
+  /** Initial backoff delay in milliseconds before the first retry. */
+  initialDelayMs?: number;
+  /** Backoff growth factor applied per attempt. Default 2. */
+  backoffMultiplier?: number;
+  /** Upper bound for a single backoff delay in milliseconds. */
+  maxDelayMs?: number;
+  /** Node statuses that should not be retried even when retries are enabled. */
+  nonRetryableStatuses?: WorkflowNodeStatus[];
 }
 
 export interface WorkflowInputDefinition {
