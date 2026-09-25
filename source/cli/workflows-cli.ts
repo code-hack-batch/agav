@@ -4,7 +4,7 @@ import { loadConfig } from "../config/config.js";
 import { createProvider } from "../providers/registry.js";
 import { buildSystemPrompt } from "../utils/system-prompt.js";
 import { getAgent, loadAgents } from "../agents/loader.js";
-import { executeA2AAgent, executeNativeAgent } from "../agents/executor.js";
+import { executeA2AAgentDetailed, executeNativeAgentDetailed } from "../agents/executor.js";
 import { validateWorkflow } from "../workflows/validator.js";
 import { listWorkflows, loadWorkflow } from "../workflows/loader.js";
 import { runWorkflow, resumeWorkflow } from "../workflows/runtime.js";
@@ -73,8 +73,11 @@ async function makeRuntimeDeps() {
     loadAgent: async (name: string) => getAgent(name) ?? null,
     executeAgent: async (agent: AgentDefinition, task: string, execOptions: { signal?: AbortSignal; idempotencyKey?: string }) => {
       const context = execOptions.idempotencyKey ? { idempotencyKey: execOptions.idempotencyKey } : undefined;
-      if (agent.manifest.type === "a2a") return executeA2AAgent(agent, task, { signal: execOptions.signal, context });
-      return executeNativeAgent(agent, task, { provider, config, signal: execOptions.signal });
+      if (agent.manifest.type === "a2a") {
+        const result = await executeA2AAgentDetailed(agent, task, { signal: execOptions.signal, context });
+        return { output: result.output, usage: result.usage };
+      }
+      return executeNativeAgentDetailed(agent, task, { provider, config, signal: execOptions.signal });
     },
     executeSkill: async (name: string, args: string, options: { model?: string; effort?: typeof config.effort; permissionMode?: typeof config.permissionMode }) => {
       const skill = getSkill(name);
@@ -88,7 +91,7 @@ async function makeRuntimeDeps() {
         effort: options.effort ?? config.effort,
         maxIterations: config.maxIterations,
       });
-      return result.output;
+      return { output: result.output, usage: result.tokenUsage };
     },
   };
 }

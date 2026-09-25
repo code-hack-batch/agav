@@ -1,6 +1,6 @@
 import type { CommandContext, CommandResult, SlashCommand } from "./types.js";
 import { getAgent, loadAgents } from "../agents/loader.js";
-import { executeA2AAgent, executeNativeAgent } from "../agents/executor.js";
+import { executeA2AAgentDetailed, executeNativeAgentDetailed } from "../agents/executor.js";
 import { getSkill } from "../skills/loader.js";
 import { executeSkill } from "../skills/executor.js";
 import { cancelWorkflow, decideWorkflowApproval, getWorkflowRunMetrics, getWorkflowRunSummary, pauseWorkflow, retryWorkflowNode } from "../workflows/control.js";
@@ -57,14 +57,25 @@ async function ensureAgentsLoaded(): Promise<void> {
   await loadAgents().catch(() => []);
 }
 
-async function executeWorkflowAgent(agent: AgentDefinition, task: string, context: CommandContext, signal?: AbortSignal, idempotencyKey?: string): Promise<string> {
-  if (agent.manifest.type === "a2a") return executeA2AAgent(agent, task, { signal, context: idempotencyKey ? { idempotencyKey } : undefined });
+async function executeWorkflowAgent(
+  agent: AgentDefinition,
+  task: string,
+  context: CommandContext,
+  signal?: AbortSignal,
+  idempotencyKey?: string,
+): Promise<{ output: string; usage?: import("../workflows/types.js").WorkflowUsage }> {
+  const a2aContext = idempotencyKey ? { idempotencyKey } : undefined;
+  if (agent.manifest.type === "a2a") {
+    const result = await executeA2AAgentDetailed(agent, task, { signal, context: a2aContext });
+    return { output: result.output, usage: result.usage };
+  }
   if (!context.provider) throw new Error("Cannot run native agent workflow without an active provider");
-  return executeNativeAgent(agent, task, {
+  const result = await executeNativeAgentDetailed(agent, task, {
     provider: context.provider,
     config: context.config,
     signal,
   });
+  return { output: result.output, usage: result.usage };
 }
 
 async function runtimeDeps(context: CommandContext, store: WorkflowStore) {
@@ -89,7 +100,7 @@ async function runtimeDeps(context: CommandContext, store: WorkflowStore) {
         effort: options.effort ?? context.config.effort,
         maxIterations: context.config.maxIterations,
       });
-      return result.output;
+      return { output: result.output, usage: result.tokenUsage };
     },
   };
 }

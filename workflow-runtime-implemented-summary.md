@@ -196,6 +196,46 @@ retrySafe: boolean             // permits crash retry without approval
 agents, and A2A agents receive the key in their invocation context. The default
 key is `${run.id}:${node.id}` and can be overridden per node via `idempotencyKey`.
 
+## Token usage accounting
+
+Token usage is now captured for **every** node type that can call a model, not
+just `prompt`/`reduce`.
+
+### Executor APIs
+
+```ts
+// source/agents/executor.ts
+executeNativeAgentDetailed(agent, task, deps): Promise<AgentRunResult>
+executeNativeAgent(agent, task, deps): Promise<string>          // unchanged
+executeA2AAgentDetailed(agent, task, opts): Promise<AgentRunResult>
+executeA2AAgent(agent, task, opts): Promise<string>             // unchanged
+
+// source/agents/a2a-client.ts
+readA2AUsage(metadata): A2AUsage                               // zeroed when absent
+```
+
+`AgentRunResult` is `{ output, usage }`. The original string-returning functions
+are kept as thin wrappers, so existing callers are unaffected.
+
+### Where usage comes from
+
+| Node type | Source |
+| --- | --- |
+| `agent` (native) | `usage` events from `runAgentLoop`, accumulated in `executeNativeAgentDetailed` |
+| `agent` (A2A) | `usage` / `tokenUsage` in the response metadata, via `readA2AUsage` |
+| `skill` | `tokenUsage` already returned by `executeSkill` |
+| `prompt` / `reduce` | `usage` events from `runAgentLoop` |
+| `tool`, `test`, `approval` | no model calls, so no usage |
+
+Usage lands on the node checkpoint and folds into `computeRunMetrics`, so
+`/workflows metrics` now reports the true token cost of a run.
+
+### Backward compatibility
+
+`WorkflowRuntimeDeps.executeAgent` and `executeSkill` accept either a plain
+string or a `{ output, usage }` result, so custom executors written against the
+old contract keep working.
+
 ## Observability
 
 Added `source/workflows/metrics.ts`, which derives a metrics rollup from a run summary.
@@ -411,6 +451,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.agent-usage.test.ts` | Agent/skill usage recording, string-result backward compatibility, metrics folding, usage normalization, A2A metadata parsing. |
 | `source/__tests__/workflows.retry-hardening.test.ts` | Retry decision table, attempt budgets, backoff math, automatic retry-until-success, exhaustion, operator reset after exhaustion, timeout retry, dry-run safety. |
 | `source/__tests__/workflows.observability.test.ts` | Node status counts, token aggregation, attempt/retried tracking, dry-run/mock flags, per-type and slowest-node timing, duration formatting, log reading, node timing regression. |
 | `source/__tests__/workflows.loop.test.ts` | Loop early exit, ordering, per-iteration aggregation, exhaustion, fail-fast, scoped checkpoints, resume, validation. |
@@ -452,10 +493,4 @@ checked. Enforce them against the usage metrics the observability layer
 already computes, so a runaway agent node stops the run instead of silently
 overspending.
 
-## Known gaps
-
-- agent-node token usage is not captured (only `prompt`/`reduce` nodes report
-  it), so budget enforcement would initially cover prompt/reduce nodes only;
-- metrics are computed on demand, not persisted or aggregated across runs;
-- cancellation remains cooperative: a tool that ignores `AbortSignal` keeps
-  running even after its node is checkpointed as cancelled or timed out.
+## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced.,  All model-calling node types now report usage, so the accounting needed to,  enforce them is in place.,- cost estimation requires a per-model price table; only raw token counts are,  available today;,- A2A agents that do not report usage in metadata still record zero. They must,  opt in by returning `usage` in their response;,- metrics are computed on demand, not persisted or aggregated across runs;,- cancellation remains cooperative: a tool that ignores `AbortSignal` keeps,  running even after its node is checkpointed as cancelled or timed out.,

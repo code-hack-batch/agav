@@ -27,6 +27,7 @@ import type {
   WorkflowSkillNode,
   WorkflowTestNode,
   WorkflowToolNode,
+  WorkflowUsage,
 } from "./types.js";
 import { backoffDelayMs, effectiveMaxAttempts, resolveRetryDecision, shouldRetryNode } from "./retry.js";
 import { validateWorkflow } from "./validator.js";
@@ -49,6 +50,12 @@ const DRY_RUN_SAFE_TOOLS = new Set([
   "run_tests",
 ]);
 
+/** Output of an agent or skill node, with token accounting when available. */
+export interface WorkflowAgentResult {
+  output: string;
+  usage?: WorkflowUsage;
+}
+
 export interface AgentExecutionOptions {
   model?: string;
   effort?: EffortLevel;
@@ -70,8 +77,8 @@ export interface WorkflowRuntimeDeps {
   config: AgavConfig;
   toolRegistry: ToolRegistry;
   loadAgent: (name: string) => Promise<AgentDefinition | null>;
-  executeAgent: (agent: AgentDefinition, task: string, options: AgentExecutionOptions) => Promise<string>;
-  executeSkill?: (skill: string, args: string, options: AgentExecutionOptions) => Promise<string>;
+  executeAgent: (agent: AgentDefinition, task: string, options: AgentExecutionOptions) => Promise<string | WorkflowAgentResult>;
+  executeSkill?: (skill: string, args: string, options: AgentExecutionOptions) => Promise<string | WorkflowAgentResult>;
   confirm?: (request: WorkflowApprovalRequest) => Promise<WorkflowApprovalDecision>;
   confirmTool?: (toolName: string, input: Record<string, unknown>) => Promise<ConfirmResult>;
   store?: WorkflowStore;
@@ -395,8 +402,9 @@ async function executeAgentNode(
   const agent = await deps.loadAgent(node.agent);
   if (!agent) return makeNodeRun(node, "failed", deps, { attempt, input: task, error: `Unknown agent: ${node.agent}` });
 
-  const output = await deps.executeAgent(agent, task, executionOptions(run, node, deps, options));
-  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: task, output, summary: summarizeOutput(output) }));
+  const result = await deps.executeAgent(agent, task, executionOptions(run, node, deps, options));
+  const { output, usage } = normalizeAgentResult(result);
+  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: task, output, usage, summary: summarizeOutput(output) }));
 }
 
 async function executeToolNode(
@@ -550,8 +558,9 @@ async function executeSkillNode(
   const checkpoints = await store.loadNodes(run.id);
   const args = interpolateString(node.args ?? "", { inputs: run.inputs, nodes: checkpoints });
   if (options.dryRun) return drySkipped(node, deps, args, `Dry run: skipped skill ${node.skill}`, attempt);
-  const output = await deps.executeSkill(node.skill, args, executionOptions(run, node, deps, options));
-  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: args, output, summary: summarizeOutput(output) }));
+  const result = await deps.executeSkill(node.skill, args, executionOptions(run, node, deps, options));
+  const { output, usage } = normalizeAgentResult(result);
+  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: args, output, usage, summary: summarizeOutput(output) }));
 }
 
 async function executeParallelNode(
@@ -912,6 +921,23 @@ async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
       signal.addEventListener("abort", onAbort, { once: true });
     }
   });
+}
+
+/**
+ * Accept executors that return a plain string (older callers) or a result
+ * carrying token usage.
+ */
+function normalizeAgentResult(result: string | WorkflowAgentResult): { output: string; usage?: WorkflowUsage } {
+  if (typeof result === "string") return { output: result };
+  const usage = result.usage
+    ? {
+        inputTokens: result.usage.inputTokens ?? 0,
+        outputTokens: result.usage.outputTokens ?? 0,
+        cacheReadTokens: result.usage.cacheReadTokens ?? 0,
+        cacheWriteTokens: result.usage.cacheWriteTokens ?? 0,
+      }
+    : undefined;
+  return { output: result.output, usage };
 }
 
 function makeNodeRun(

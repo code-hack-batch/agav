@@ -13,6 +13,23 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { decrypt } from "../utils/encrypt.js";
 
+/** Token accounting for a single agent invocation. */
+export interface AgentRunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
+export interface AgentRunResult {
+  output: string;
+  usage: AgentRunUsage;
+}
+
+export function emptyAgentUsage(): AgentRunUsage {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+}
+
 // AgavHooks type - defined locally since it's not exported from hooks.js
 interface AgavHooks {
   afterEdit?: string;
@@ -63,9 +80,9 @@ async function loadAgentCredentials(agentPath: string, agentName?: string): Prom
 }
 
 /**
- * Execute a native agent (JS/TS in-process)
+ * Execute a native agent and report token usage alongside the output.
  */
-export async function executeNativeAgent(
+export async function executeNativeAgentDetailed(
   agent: AgentDefinition,
   task: string,
   deps: {
@@ -83,7 +100,7 @@ export async function executeNativeAgent(
     /** Deduplicates a retried invocation of the same logical unit of work. */
     idempotencyKey?: string;
   }
-): Promise<string> {
+): Promise<AgentRunResult> {
   const callId = `${agent.manifest.name}-${randomUUID().slice(0, 8)}`;
 
   // Load per-agent runtime config: credentials + optional model/effort overrides.
@@ -149,6 +166,7 @@ export async function executeNativeAgent(
 
     let output = "";
     let loopError: Error | null = null;
+    const usage = emptyAgentUsage();
 
     const loopGenerator = runAgentLoop({
       provider: deps.provider,
@@ -177,6 +195,11 @@ export async function executeNativeAgent(
         }
       } else if (event.type === "error") {
         loopError = event.error;
+      } else if (event.type === "usage") {
+        usage.inputTokens += event.inputTokens;
+        usage.outputTokens += event.outputTokens;
+        usage.cacheReadTokens += event.cacheReadTokens ?? 0;
+        usage.cacheWriteTokens += event.cacheWriteTokens ?? 0;
       }
     }
 
@@ -184,7 +207,7 @@ export async function executeNativeAgent(
       throw loopError;
     }
 
-    return output || "Agent completed with no output.";
+    return { output: output || "Agent completed with no output.", usage };
   } finally {
     deps.onProgressUpdate?.(callId, { type: "turn_complete" });
 
@@ -195,15 +218,41 @@ export async function executeNativeAgent(
 }
 
 /**
- * Execute an A2A agent (external process via HTTP)
+ * Execute a native agent, returning only its output text.
+ *
+ * Callers that need token accounting should use executeNativeAgentDetailed.
+ */
+export async function executeNativeAgent(
+  agent: AgentDefinition,
+  task: string,
+  deps: Parameters<typeof executeNativeAgentDetailed>[2],
+): Promise<string> {
+  const result = await executeNativeAgentDetailed(agent, task, deps);
+  return result.output;
+}
+
+/**
+ * Execute an A2A agent and report any usage the agent returned.
+ */
+export async function executeA2AAgentDetailed(
+  agent: AgentDefinition,
+  task: string,
+  options: { signal?: AbortSignal; context?: Record<string, unknown> } = {},
+): Promise<AgentRunResult> {
+  const { executeA2AAgentDetailed: a2aExecute } = await import("./a2a-client.js");
+
+  const result = await a2aExecute(agent, task, options.context, options.signal);
+  return { output: result.output, usage: result.usage };
+}
+
+/**
+ * Execute an A2A agent, returning only its output text.
  */
 export async function executeA2AAgent(
   agent: AgentDefinition,
   task: string,
   options: { signal?: AbortSignal; context?: Record<string, unknown> } = {},
 ): Promise<string> {
-  const { executeA2AAgent: a2aExecute } = await import("./a2a-client.js");
-
-  const output = await a2aExecute(agent, task, options.context, options.signal);
-  return output;
+  const result = await executeA2AAgentDetailed(agent, task, options);
+  return result.output;
 }

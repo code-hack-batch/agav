@@ -54,6 +54,31 @@ interface A2AResponse {
   metadata?: Record<string, unknown>;
 }
 
+/** Token accounting reported by an A2A agent, when it provides it. */
+export interface A2AUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
+/**
+ * Extract usage from A2A response metadata when the agent reports it.
+ * Returns zeroed usage when absent, so callers can always accumulate safely.
+ */
+export function readA2AUsage(metadata: Record<string, unknown> | undefined): A2AUsage {
+  const empty: A2AUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  if (!metadata) return empty;
+  const source = (metadata.usage ?? metadata.tokenUsage ?? metadata) as Record<string, unknown>;
+  const num = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+  return {
+    inputTokens: num(source.inputTokens),
+    outputTokens: num(source.outputTokens),
+    cacheReadTokens: num(source.cacheReadTokens),
+    cacheWriteTokens: num(source.cacheWriteTokens),
+  };
+}
+
 /**
  * A2A event types for streaming
  */
@@ -206,14 +231,14 @@ export function stopAllA2AAgents(): void {
 }
 
 /**
- * Execute a task on an A2A agent
+ * Execute a task on an A2A agent, returning output and any reported usage.
  */
-export async function executeA2AAgent(
+export async function executeA2AAgentDetailed(
   agent: AgentDefinition,
   task: string,
   context?: Record<string, unknown>,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<{ output: string; usage: A2AUsage }> {
   const key = agent.alias || agent.manifest.name;
 
   // Ensure agent is started
@@ -252,7 +277,7 @@ export async function executeA2AAgent(
       throw new Error(result.output);
     }
 
-    return result.output;
+    return { output: result.output, usage: readA2AUsage(result.metadata) };
   } catch (error) {
     throw new Error(
       `A2A execution failed: ${error instanceof Error ? error.message : String(error)}`
