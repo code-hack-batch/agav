@@ -138,6 +138,8 @@ export interface WorkflowLoopNode extends WorkflowNodeBase {
     node: string;
     status?: WorkflowNodeStatus;
   };
+  /** When true, a body node failure ends the loop instead of the next iteration. */
+  stopOnFailure?: boolean;
 }
 
 export type WorkflowNodeDefinition =

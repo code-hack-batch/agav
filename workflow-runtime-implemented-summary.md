@@ -34,7 +34,7 @@ The workflow runtime now supports:
 | `prompt` / `reduce` | Implemented |
 | `skill` | Implemented when an executor is supplied |
 | `parallel` | Implemented (fan-out/fan-in, bounded concurrency, child checkpoints) |
-| `loop` | Defined, not implemented yet |
+| `loop` | Implemented (bounded iterations, per-iteration checkpoints, `stopWhen`) |
 
 ## Parallel node
 
@@ -77,6 +77,67 @@ aggregates child outputs into a single parent checkpoint.
 - A child may depend on a sibling child or on a top-level node.
 - A child may **not** depend on a node scoped inside another `parallel` or
   `loop` node; the validator rejects this with an explicit issue.
+
+## Loop node
+
+A `loop` node repeats its `body` up to a bounded number of iterations and
+stops early when a body node reaches the configured `stopWhen` status.
+
+```yaml
+- id: fix_until_green
+  type: loop
+  maxIterations: 3
+  stopOnFailure: false
+  stopWhen:
+    node: run_tests
+    status: passed
+  body:
+    - id: run_tests
+      type: test
+      assertions:
+        - type: command
+          command: pnpm test
+    - id: fix
+      type: agent
+      agent: coding_agent
+      task: Fix the failures
+```
+
+### Behavior
+
+| Concern | Behavior |
+| --- | --- |
+| Iteration bound | `node.maxIterations` → `policies.maxIterations` → `3` |
+| Early exit | Stops when `stopWhen.node` reaches `stopWhen.status` (default `passed`) |
+| Exhaustion | Fails when the bound is reached without satisfying `stopWhen` |
+| Failure policy | `stopOnFailure: true` (default) fails fast; `false` continues to the next iteration |
+| Output | `{ iterations, completedIterations, stoppedEarly, exhausted }` |
+| Cancellation | Signal checked before each iteration |
+
+### Per-iteration checkpoint identity
+
+Each body node runs under an iteration-scoped id (`<nodeId>#<iteration>`), so
+every iteration gets its own checkpoint and attempt history:
+
+```text
+nodes/check#1.json
+nodes/check#2.json
+nodes/check#1.attempts/1.json
+```
+
+This is what makes loop resume correct: on resume the loop replays from
+iteration 1 but reuses any existing terminal checkpoint for that exact
+iteration, so completed iterations are never re-executed.
+
+A `failed` body checkpoint from an earlier pass is still a real result and is
+reused. Only a `running` (interrupted) checkpoint is re-executed.
+
+### Scoping rules
+
+- Body nodes are owned by the loop and are not scheduled as run-level nodes.
+- A body node may depend on another body node or a top-level node.
+- `stopWhen.node` must name a body node; the validator rejects it otherwise.
+- `maxIterations` must be a positive integer.
 
 ## Dry-run mode
 
@@ -238,6 +299,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.loop.test.ts` | Loop early exit, ordering, per-iteration aggregation, exhaustion, fail-fast, scoped checkpoints, resume, validation. |
 | `source/__tests__/workflows.dry-run-evals.test.ts` | Dry-run skipping, safe tool behavior, mocks, eval fixture loading/running. |
 | `source/__tests__/workflows.attempts-cancellation.test.ts` | Attempt history, retry attempt increments, timeout checkpoint, pre-abort pause. |
 | `source/__tests__/workflows.loader.test.ts` | Workflow YAML/JSON loading/listing. |

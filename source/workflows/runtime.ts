@@ -17,6 +17,7 @@ import type {
   WorkflowMocks,
   WorkflowNodeDefinition,
   WorkflowNodeRun,
+  WorkflowLoopNode,
   WorkflowNodeStatus,
   WorkflowParallelNode,
   WorkflowPromptNode,
@@ -30,6 +31,7 @@ import type {
 import { validateWorkflow } from "./validator.js";
 
 const DEFAULT_MAX_CONCURRENCY = 4;
+const DEFAULT_MAX_ITERATIONS = 3;
 const ajv = new Ajv({ allErrors: true, strict: false });
 
 const DRY_RUN_SAFE_TOOLS = new Set([
@@ -306,7 +308,7 @@ async function executeNode(
       case "parallel":
         return executeParallelNode(run, node, deps, store, options, attempt);
       case "loop":
-        return makeNodeRun(node, "failed", deps, { attempt, error: "loop nodes are reserved but not implemented in this runtime slice" });
+        return executeLoopNode(run, node, deps, store, options, attempt);
       default:
         return makeNodeRun(node, "failed", deps, { attempt, error: `Unsupported node type ${(node as WorkflowNodeDefinition).type}` });
     }
@@ -589,6 +591,227 @@ async function executeParallelNode(
     output: { childOutputs },
     summary: `Completed ${children.length} parallel child node(s)`,
   }));
+}
+
+async function executeLoopNode(
+  run: WorkflowRun,
+  node: WorkflowLoopNode,
+  deps: WorkflowRuntimeDeps,
+  store: WorkflowStore,
+  options: WorkflowRunOptions,
+  attempt: number,
+): Promise<WorkflowNodeRun> {
+  const body = node.body ?? [];
+  const bodyIds = new Set(body.map((child) => child.id));
+  const maxIterations = node.maxIterations ?? run.policies.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+  const stopWhenNode = node.stopWhen?.node;
+  const stopWhenStatus = node.stopWhen?.status ?? "passed";
+
+  if (stopWhenNode && !bodyIds.has(stopWhenNode)) {
+    return makeNodeRun(node, "failed", deps, {
+      attempt,
+      error: `Loop stopWhen node ${stopWhenNode} must be a body node`,
+    });
+  }
+
+  // A loop always restarts from iteration 1 unless it already finished, so an
+  // interrupted run replays the body deterministically. Per-iteration
+  // checkpoints prevent re-executing iterations that already completed.
+  const iterations: Array<Record<string, unknown>> = [];
+  let completedIterations = 0;
+  let stoppedEarly = false;
+  let exhaustedFailure: string | undefined;
+
+  for (let iteration = 1; iteration <= maxIterations; iteration++) {
+    if (activeSignal(deps, options)?.aborted) {
+      return makeNodeRun(node, "cancelled", deps, {
+        attempt,
+        input: { maxIterations },
+        output: { iterations, completedIterations, interruptedAt: iteration },
+        summary: `Workflow paused by signal at loop iteration ${iteration}`,
+        error: "Workflow paused by signal during loop node",
+      });
+    }
+
+    const bodyRun = await executeLoopIteration(run, node, body, iteration, deps, store, options);
+    iterations.push(bodyRun.outputs);
+
+    if (bodyRun.status === "waiting_approval") {
+      return makeNodeRun(node, "waiting_approval", deps, {
+        attempt,
+        input: { maxIterations },
+        output: { iterations, completedIterations, awaitingApproval: bodyRun.awaitingApproval },
+        summary: `Loop iteration ${iteration} awaiting approval: ${bodyRun.awaitingApproval?.join(", ")}`,
+      });
+    }
+
+    if (bodyRun.status === "failed" || bodyRun.status === "timed_out" || bodyRun.status === "cancelled") {
+      if (node.stopOnFailure ?? true) {
+        return makeNodeRun(node, "failed", deps, {
+          attempt,
+          input: { maxIterations },
+          output: { iterations, completedIterations: completedIterations + 1, failedIteration: iteration },
+          summary: `Loop iteration ${iteration} failed: ${bodyRun.summary ?? bodyRun.status}`,
+          error: bodyRun.error ?? bodyRun.status,
+        });
+      }
+      // A non-fatal body failure counts as a completed iteration so the loop
+      // can continue and retry the work on the next pass.
+      completedIterations = iteration;
+      exhaustedFailure = bodyRun.error ?? bodyRun.status;
+      if (stopWhenNode && bodyRun.statuses[stopWhenNode] === stopWhenStatus) {
+        stoppedEarly = true;
+        break;
+      }
+      continue;
+    }
+
+    completedIterations = iteration;
+    exhaustedFailure = undefined;
+
+    if (stopWhenNode && bodyRun.statuses[stopWhenNode] === stopWhenStatus) {
+      stoppedEarly = true;
+      break;
+    }
+  }
+
+  if (exhaustedFailure) {
+    return makeNodeRun(node, "failed", deps, {
+      attempt,
+      input: { maxIterations },
+      output: { iterations, completedIterations, exhausted: true },
+      summary: `Loop exhausted after ${completedIterations} iteration(s) without satisfying stopWhen`,
+      error: exhaustedFailure,
+    });
+  }
+
+  const summary = stoppedEarly
+    ? `Loop stopped after ${completedIterations} iteration(s) because ${stopWhenNode} was ${stopWhenStatus}`
+    : `Loop completed ${completedIterations} iteration(s) without satisfying stopWhen`;
+
+  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, {
+    attempt,
+    input: { maxIterations },
+    output: { iterations, completedIterations, stoppedEarly, exhausted: !stoppedEarly },
+    summary,
+  }));
+}
+
+async function executeLoopIteration(
+  run: WorkflowRun,
+  node: WorkflowLoopNode,
+  body: WorkflowNodeDefinition[],
+  iteration: number,
+  deps: WorkflowRuntimeDeps,
+  store: WorkflowStore,
+  options: WorkflowRunOptions,
+): Promise<LoopIterationResult> {
+  const bodyById = new Map(body.map((child) => [child.id, child]));
+  const maxConcurrency = Math.max(1, run.policies.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
+  const outputs: Record<string, unknown> = {};
+  const statuses: Record<string, WorkflowNodeStatus> = {};
+  const done = new Set<string>();
+  const awaitingApproval: string[] = [];
+
+  // Reuse checkpoints from earlier attempts of this run so an interrupted
+  // loop does not re-run body nodes that already produced a result.
+  const initialCheckpoints = await store.loadNodes(run.id);
+  for (const child of body) {
+    const existing = initialCheckpoints[loopNodeKey(child.id, iteration)];
+    if (!existing || existing.nodeHash !== hashValue(scopedLoopNode(child, iteration))) continue;
+    if (existing.status === "running") continue;
+    outputs[child.id] = existing.output;
+    statuses[child.id] = existing.status;
+    done.add(child.id);
+    if (existing.status === "waiting_approval") awaitingApproval.push(child.id);
+  }
+
+  let guard = body.length * body.length + body.length + 2;
+
+  while (done.size < body.length) {
+    if (activeSignal(deps, options)?.aborted) {
+      return { status: "cancelled", outputs, statuses, error: "Workflow paused by signal during loop iteration" };
+    }
+    if (awaitingApproval.length > 0) {
+      return { status: "waiting_approval", outputs, statuses, awaitingApproval: [...awaitingApproval] };
+    }
+    if (guard-- <= 0) {
+      const stuck = body.filter((child) => !done.has(child.id)).map((child) => child.id);
+      return { status: "failed", outputs, statuses, error: `Loop iteration stalled; unfinished body nodes: ${stuck.join(", ")}` };
+    }
+
+    const checkpoints = await store.loadNodes(run.id);
+    const ready = body.filter((child) => {
+      if (done.has(child.id)) return false;
+      return (child.dependsOn ?? []).every((depId) => {
+        if (bodyById.has(depId)) return done.has(depId);
+        const depCheckpoint = checkpoints[depId];
+        return depCheckpoint?.status === "passed" || (options.dryRun === true && depCheckpoint?.status === "skipped");
+      });
+    });
+
+    if (ready.length === 0) {
+      const blocked = body.filter((child) => !done.has(child.id)).map((child) => child.id);
+      return { status: "failed", outputs, statuses, error: `Loop iteration made no progress; unfinished body nodes: ${blocked.join(", ")}` };
+    }
+
+    const batch = ready.slice(0, maxConcurrency);
+    const settled = await Promise.all(
+      batch.map(async (child) => ({ child, result: await executeLoopBodyNode(run, child, iteration, deps, store, options) })),
+    );
+
+    let failed: string | undefined;
+    for (const { child, result } of settled) {
+      outputs[child.id] = result.output;
+      statuses[child.id] = result.status;
+      if (result.status === "waiting_approval") {
+        awaitingApproval.push(child.id);
+        continue;
+      }
+      if (result.status === "failed" || result.status === "timed_out" || result.status === "cancelled") {
+        failed = [failed, result.error ?? result.status].filter(Boolean).join("; ") ?? result.status;
+        continue;
+      }
+      done.add(child.id);
+    }
+
+    if (awaitingApproval.length > 0) {
+      return { status: "waiting_approval", outputs, statuses, awaitingApproval: [...awaitingApproval] };
+    }
+    if (failed) {
+      return { status: "failed", outputs, statuses, error: failed };
+    }
+  }
+
+  return { status: "passed", outputs, statuses };
+}
+
+interface LoopIterationResult {
+  status: WorkflowNodeStatus;
+  outputs: Record<string, unknown>;
+  statuses: Record<string, WorkflowNodeStatus>;
+  awaitingApproval?: string[];
+  error?: string;
+  summary?: string;
+}
+
+function loopNodeKey(nodeId: string, iteration: number): string {
+  return `${nodeId}#${iteration}`;
+}
+
+function scopedLoopNode(child: WorkflowNodeDefinition, iteration: number): WorkflowNodeDefinition {
+  return { ...child, id: loopNodeKey(child.id, iteration) };
+}
+
+async function executeLoopBodyNode(
+  run: WorkflowRun,
+  child: WorkflowNodeDefinition,
+  iteration: number,
+  deps: WorkflowRuntimeDeps,
+  store: WorkflowStore,
+  options: WorkflowRunOptions,
+): Promise<WorkflowNodeRun> {
+  return executeNode(run, scopedLoopNode(child, iteration), deps, store, options);
 }
 
 function makeNodeRun(
