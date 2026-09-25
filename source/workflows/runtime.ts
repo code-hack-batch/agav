@@ -18,6 +18,7 @@ import type {
   WorkflowNodeDefinition,
   WorkflowNodeRun,
   WorkflowNodeStatus,
+  WorkflowParallelNode,
   WorkflowPromptNode,
   WorkflowRun,
   WorkflowRunOptions,
@@ -26,7 +27,7 @@ import type {
   WorkflowTestNode,
   WorkflowToolNode,
 } from "./types.js";
-import { flattenNodes, validateWorkflow } from "./validator.js";
+import { validateWorkflow } from "./validator.js";
 
 const DEFAULT_MAX_CONCURRENCY = 4;
 const ajv = new Ajv({ allErrors: true, strict: false });
@@ -138,7 +139,10 @@ async function executeWorkflowRun(
   run.updatedAt = isoNow(deps);
   await store.saveRun(run);
 
-  const allNodes = flattenNodes(run.definition.nodes);
+  // Only top-level nodes are scheduled by the run loop. Nested `parallel`
+  // children are owned and scheduled by their parent node, so they must not
+  // be treated as independent run-level nodes here.
+  const allNodes = run.definition.nodes;
   const nodeById = new Map(allNodes.map((node) => [node.id, node]));
   const completedThisRun = new Set<string>();
   const failedThisRun = new Set<string>();
@@ -300,8 +304,9 @@ async function executeNode(
       case "skill":
         return executeSkillNode(run, node, deps, store, options, attempt);
       case "parallel":
+        return executeParallelNode(run, node, deps, store, options, attempt);
       case "loop":
-        return makeNodeRun(node, "failed", deps, { attempt, error: `${node.type} nodes are reserved but not implemented in this runtime slice` });
+        return makeNodeRun(node, "failed", deps, { attempt, error: "loop nodes are reserved but not implemented in this runtime slice" });
       default:
         return makeNodeRun(node, "failed", deps, { attempt, error: `Unsupported node type ${(node as WorkflowNodeDefinition).type}` });
     }
@@ -485,6 +490,105 @@ async function executeSkillNode(
   if (options.dryRun) return drySkipped(node, deps, args, `Dry run: skipped skill ${node.skill}`, attempt);
   const output = await deps.executeSkill(node.skill, args, executionOptions(run, node, deps, options));
   return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: args, output, summary: summarizeOutput(output) }));
+}
+
+async function executeParallelNode(
+  run: WorkflowRun,
+  node: WorkflowParallelNode,
+  deps: WorkflowRuntimeDeps,
+  store: WorkflowStore,
+  options: WorkflowRunOptions,
+  attempt: number,
+): Promise<WorkflowNodeRun> {
+  const children = node.children ?? [];
+  const childById = new Map(children.map((child) => [child.id, child]));
+  const maxConcurrency = Math.max(1, node.maxConcurrency ?? run.policies.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
+
+  // Children that already completed (for example on a resumed run) count as done
+  // so the fan-out does not fail on a replay and does not re-execute them.
+  const done = new Set<string>();
+  const initialCheckpoints = await store.loadNodes(run.id);
+  for (const child of children) {
+    const existing = initialCheckpoints[child.id];
+    if (existing?.nodeHash !== hashValue(child)) continue;
+    if (existing.status === "passed" || existing.status === "skipped" || existing.status === "waiting_approval") {
+      done.add(child.id);
+    }
+  }
+
+  let guard = children.length * children.length + children.length + 2;
+
+  while (done.size < children.length) {
+    if (activeSignal(deps, options)?.aborted) {
+      return makeNodeRun(node, "cancelled", deps, { attempt, error: "Workflow paused by signal during parallel node" });
+    }
+    if (guard-- <= 0) {
+      const stuck = children.filter((child) => !done.has(child.id)).map((child) => child.id);
+      return makeNodeRun(node, "failed", deps, { attempt, error: `Parallel node stalled; unfinished children: ${stuck.join(", ")}` });
+    }
+
+    const checkpoints = await store.loadNodes(run.id);
+    const ready = children.filter((child) => {
+      if (done.has(child.id)) return false;
+      const existing = checkpoints[child.id];
+      if (existing?.status === "passed" && existing.nodeHash === hashValue(child)) return false;
+      if (existing?.status === "skipped" && existing.nodeHash === hashValue(child)) return false;
+      if (existing?.status === "failed" && existing.nodeHash === hashValue(child)) return false;
+      return (child.dependsOn ?? []).every((depId) => {
+        if (childById.has(depId)) return done.has(depId);
+        const depCheckpoint = checkpoints[depId];
+        return depCheckpoint?.status === "passed" || (options.dryRun === true && depCheckpoint?.status === "skipped");
+      });
+    });
+
+    if (ready.length === 0) {
+      const blocked = children.filter((child) => !done.has(child.id)).map((child) => child.id);
+      return makeNodeRun(node, "failed", deps, { attempt, error: `Parallel node made no progress; unfinished children: ${blocked.join(", ")}` });
+    }
+
+    const batch = ready.slice(0, maxConcurrency);
+    const results = await Promise.all(batch.map((child) => executeNode(run, child, deps, store, options)));
+
+    for (const result of results) {
+      if (result.status === "passed" || result.status === "skipped" || result.status === "waiting_approval") {
+        done.add(result.id);
+      }
+    }
+
+    const failures = results.filter((result) => result.status === "failed" || result.status === "timed_out" || result.status === "cancelled");
+    if (failures.length > 0) {
+      const childOutputs: Record<string, unknown> = {};
+      for (const result of results) childOutputs[result.id] = result.output;
+      return makeNodeRun(node, "failed", deps, {
+        attempt,
+        input: children.map((child) => child.id),
+        output: { childOutputs },
+        summary: `Parallel children failed: ${failures.map((result) => `${result.id} (${result.status})`).join(", ")}`,
+        error: failures.map((result) => result.error ?? result.status).join("; "),
+      });
+    }
+  }
+
+  const finalCheckpoints = await store.loadNodes(run.id);
+  const childOutputs: Record<string, unknown> = {};
+  for (const child of children) childOutputs[child.id] = finalCheckpoints[child.id]?.output;
+
+  const waiting = children.filter((child) => finalCheckpoints[child.id]?.status === "waiting_approval");
+  if (waiting.length > 0) {
+    return makeNodeRun(node, "waiting_approval", deps, {
+      attempt,
+      input: children.map((child) => child.id),
+      output: { childOutputs, awaitingApproval: waiting.map((child) => child.id) },
+      summary: `Parallel children awaiting approval: ${waiting.map((child) => child.id).join(", ")}`,
+    });
+  }
+
+  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, {
+    attempt,
+    input: children.map((child) => child.id),
+    output: { childOutputs },
+    summary: `Completed ${children.length} parallel child node(s)`,
+  }));
 }
 
 function makeNodeRun(

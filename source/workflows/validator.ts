@@ -47,8 +47,13 @@ export async function validateWorkflow(
   const nodeIds = new Set<string>();
   collectNodeIds(nodes, issues, nodeIds, "nodes");
 
+  const topLevelIds = new Set<string>();
+  for (const node of nodes) {
+    if (node && typeof node === "object" && typeof node.id === "string") topLevelIds.add(node.id);
+  }
+
   for (const [index, node] of nodes.entries()) {
-    await validateNode(node, `nodes[${index}]`, nodeIds, issues, deps);
+    await validateNode(node, `nodes[${index}]`, nodeIds, issues, deps, topLevelIds);
   }
 
   validateAcyclic(nodes, issues);
@@ -87,6 +92,7 @@ async function validateNode(
   nodeIds: Set<string>,
   issues: WorkflowValidationIssue[],
   deps: WorkflowValidationDeps,
+  topLevelIds: Set<string> = new Set(),
 ): Promise<void> {
   if (!SUPPORTED_NODE_TYPES.has(node.type)) {
     issues.push({ path: `${path}.type`, message: `Unsupported node type: ${String(node.type)}` });
@@ -139,9 +145,21 @@ async function validateNode(
     if (!Array.isArray(node.children) || node.children.length === 0) {
       issues.push({ path: `${path}.children`, message: "Parallel node requires children" });
     } else {
+      const childIds = new Set(node.children.map((child) => child?.id));
       for (const [index, child] of node.children.entries()) {
         await validateNode(child, `${path}.children[${index}]`, nodeIds, issues, deps);
+        for (const dep of child.dependsOn ?? []) {
+          if (!childIds.has(dep) && !topLevelIds.has(dep)) {
+            issues.push({
+              path: `${path}.children[${index}].dependsOn`,
+              message: `Unknown dependency: ${dep}. Parallel children may only depend on sibling children or top-level nodes.`,
+            });
+          }
+        }
       }
+    }
+    if (node.maxConcurrency !== undefined && (!Number.isInteger(node.maxConcurrency) || node.maxConcurrency <= 0)) {
+      issues.push({ path: `${path}.maxConcurrency`, message: "Parallel maxConcurrency must be a positive integer" });
     }
   }
 
@@ -149,8 +167,17 @@ async function validateNode(
     if (!Array.isArray(node.body) || node.body.length === 0) {
       issues.push({ path: `${path}.body`, message: "Loop node requires body" });
     } else {
+      const bodyIds = new Set(node.body.map((child) => child?.id));
       for (const [index, child] of node.body.entries()) {
         await validateNode(child, `${path}.body[${index}]`, nodeIds, issues, deps);
+        for (const dep of child.dependsOn ?? []) {
+          if (!bodyIds.has(dep) && !topLevelIds.has(dep)) {
+            issues.push({
+              path: `${path}.body[${index}].dependsOn`,
+              message: `Unknown dependency: ${dep}. Loop body nodes may only depend on other body nodes or top-level nodes.`,
+            });
+          }
+        }
       }
     }
     if (node.maxIterations !== undefined && (!Number.isInteger(node.maxIterations) || node.maxIterations <= 0)) {

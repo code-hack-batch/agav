@@ -23,6 +23,61 @@ The workflow runtime now supports:
 - basic `retryPolicy.maxAttempts` enforcement;
 - idempotency key propagation to A2A workflow agents.
 
+## Node types implemented
+
+| Node type | Status |
+| --- | --- |
+| `tool` | Implemented |
+| `agent` (native + A2A) | Implemented |
+| `test` | Implemented |
+| `approval` | Implemented |
+| `prompt` / `reduce` | Implemented |
+| `skill` | Implemented when an executor is supplied |
+| `parallel` | Implemented (fan-out/fan-in, bounded concurrency, child checkpoints) |
+| `loop` | Defined, not implemented yet |
+
+## Parallel node
+
+A `parallel` node runs its `children` with a bounded concurrency limit and
+aggregates child outputs into a single parent checkpoint.
+
+```yaml
+- id: inspect_all
+  type: parallel
+  maxConcurrency: 3
+  dependsOn: [seed]
+  children:
+    - id: inspect_auth
+      type: agent
+      agent: reviewer
+      task: Inspect auth
+    - id: inspect_api
+      type: agent
+      agent: reviewer
+      task: Inspect API
+```
+
+### Behavior
+
+| Concern | Behavior |
+| --- | --- |
+| Concurrency | `node.maxConcurrency` → `policies.maxConcurrency` → `4` |
+| Child ordering | Children run in dependency order; siblings without deps run together |
+| Output | `{ childOutputs: { <childId>: <output> } }` |
+| Child failure | Parent fails with the failing child statuses and errors |
+| Approval children | Parent becomes `waiting_approval` and lists awaiting children |
+| Cancellation | Signal is checked between child batches |
+| Checkpoints | Every child writes its own checkpoint and attempt history |
+| Resume | Children already `passed`/`skipped` are not re-executed |
+
+### Scoping rules
+
+- Nested children are owned by their parent `parallel` node and are **not**
+  scheduled as independent run-level nodes.
+- A child may depend on a sibling child or on a top-level node.
+- A child may **not** depend on a node scoped inside another `parallel` or
+  `loop` node; the validator rejects this with an explicit issue.
+
 ## Dry-run mode
 
 ### Commands
@@ -182,6 +237,7 @@ Remaining retry/idempotency work:
 
 | Test file | Coverage |
 | --- | --- |
+| `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
 | `source/__tests__/workflows.dry-run-evals.test.ts` | Dry-run skipping, safe tool behavior, mocks, eval fixture loading/running. |
 | `source/__tests__/workflows.attempts-cancellation.test.ts` | Attempt history, retry attempt increments, timeout checkpoint, pre-abort pause. |
 | `source/__tests__/workflows.loader.test.ts` | Workflow YAML/JSON loading/listing. |
