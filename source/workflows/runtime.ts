@@ -316,9 +316,13 @@ async function executeNode(
 
   const result = await withNodeTimeout(executeCurrentNode(), run, node, deps, attempt, options);
 
-  await store.saveNode(run.id, result);
-  await trace(store, run.id, node.id, { type: "node_completed", nodeId: node.id, status: result.status, dryRun: result.dryRun === true });
-  return result;
+  // Preserve the start timestamp captured before execution so metrics and
+  // status views report real elapsed time instead of a zero-length window.
+  const completed = result.startedAt === started.startedAt ? result : { ...result, startedAt: started.startedAt };
+
+  await store.saveNode(run.id, completed);
+  await trace(store, run.id, node.id, { type: "node_completed", nodeId: node.id, status: completed.status, dryRun: completed.dryRun === true });
+  return completed;
 }
 
 async function executeAgentNode(
@@ -828,7 +832,7 @@ function makeNodeRun(
     attempt: extra.attempt ?? 1,
     nodeHash: hashValue(node),
     startedAt: extra.startedAt ?? now,
-    endedAt: status === "running" || status === "waiting_approval" ? undefined : now,
+    endedAt: status === "running" || status === "waiting_approval" ? undefined : extra.endedAt ?? now,
     ...extra,
   };
 }

@@ -131,6 +131,29 @@ export class WorkflowStore {
     await mkdir(dirname(path), { recursive: true });
     await appendFile(path, line + "\n");
   }
+
+  async readLog(runId: string, nodeId: string, limit = 50): Promise<string[]> {
+    try {
+      const raw = await readFile(this.logPath(runId, nodeId), "utf8");
+      const lines = raw.split("\n").filter((line) => line.trim().length > 0);
+      return limit > 0 ? lines.slice(-limit) : lines;
+    } catch {
+      return [];
+    }
+  }
+
+  async readRunLogs(runId: string, limit = 20): Promise<Array<{ nodeId: string; lines: string[] }>> {
+    const dir = join(this.runDir(runId), "logs");
+    if (!existsSync(dir)) return [];
+    const entries = (await readdir(dir)).filter((entry) => entry.endsWith(".log"));
+    const out: Array<{ nodeId: string; lines: string[] }> = [];
+    for (const entry of entries.sort()) {
+      const nodeId = entry.slice(0, -".log".length);
+      const lines = await this.readLog(runId, nodeId, limit);
+      if (lines.length > 0) out.push({ nodeId, lines });
+    }
+    return out;
+  }
 }
 
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {

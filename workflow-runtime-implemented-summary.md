@@ -139,6 +139,61 @@ reused. Only a `running` (interrupted) checkpoint is re-executed.
 - `stopWhen.node` must name a body node; the validator rejects it otherwise.
 - `maxIterations` must be a positive integer.
 
+## Observability
+
+Added `source/workflows/metrics.ts`, which derives a metrics rollup from a run summary.
+
+### APIs
+
+```ts
+computeRunMetrics(summary): WorkflowRunMetrics
+nodeDurationMs(node, now?): number
+formatDuration(ms): string
+formatMetrics(metrics): string
+
+getWorkflowRunMetrics(runId, store?)  // via source/workflows/control.ts
+store.readLog(runId, nodeId, limit?)
+store.readRunLogs(runId, limit?)
+```
+
+### What is measured
+
+| Metric | Source |
+| --- | --- |
+| Node counts by status | Checkpoint statuses, including `pending` nodes with no checkpoint |
+| Duration per node | `startedAt` → `endedAt` (live nodes measured against now) |
+| Duration per node type | Aggregated, sorted slowest-first |
+| Slowest nodes | Top 5 |
+| Token usage | Sum of `inputTokens`, `outputTokens`, cache read/write |
+| Attempts | Total attempts, max attempts, retried node list |
+| Dry-run / mocked / skipped | Node flags |
+| Timed out / cancelled | Node statuses |
+
+### Commands
+
+```bash
+agav workflows metrics <run-id>
+agav workflows logs <run-id> [node-id]
+agav workflows status <run-id>      # now appends the metrics rollup
+```
+
+```text
+/workflows metrics <run-id>
+/workflows logs <run-id> [node-id]
+/workflows status <run-id>          # now appends the metrics rollup
+```
+
+`runs` output gained per-run progress (`completed/total`) and duration.
+`checkpoints` output gained per-node duration, attempt count, token usage, and
+dry-run/mock markers.
+
+### Node timing fix
+
+`makeNodeRun` previously stamped `startedAt` and `endedAt` from the same clock
+reading, so every completed node reported a `0ms` duration. `executeNode` now
+carries the pre-execution `startedAt` from the `running` checkpoint onto the
+final result, so durations reflect real elapsed time.
+
 ## Dry-run mode
 
 ### Commands
@@ -299,6 +354,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.observability.test.ts` | Node status counts, token aggregation, attempt/retried tracking, dry-run/mock flags, per-type and slowest-node timing, duration formatting, log reading, node timing regression. |
 | `source/__tests__/workflows.loop.test.ts` | Loop early exit, ordering, per-iteration aggregation, exhaustion, fail-fast, scoped checkpoints, resume, validation. |
 | `source/__tests__/workflows.dry-run-evals.test.ts` | Dry-run skipping, safe tool behavior, mocks, eval fixture loading/running. |
 | `source/__tests__/workflows.attempts-cancellation.test.ts` | Attempt history, retry attempt increments, timeout checkpoint, pre-abort pause. |
@@ -321,31 +377,32 @@ pnpm vitest run source/__tests__/workflows.attempts-cancellation.test.ts source/
 
 ## Recommended next two enhancements
 
-### 1. Observability and metrics dashboard
-
-Next highest value because dry-runs, evals, attempts, and checkpointed runs now produce operational data.
-
-Add:
-
-- attempt counts in run summaries;
-- node durations;
-- token usage totals;
-- dry-run/mocked markers;
-- recent logs in status output;
-- richer `/workflows status`;
-- eventually `/ops` or `/runs` dashboard.
-
-### 2. Configurable retry/backoff/idempotency enforcement
+### 1. Configurable retry/backoff/idempotency enforcement
 
 Next safety-critical enhancement before EziSign or scheduled mutating workflows.
+Attempt history and observability now make retry behaviour measurable.
 
 Enforce:
 
-- `retryPolicy.maxAttempts`;
+- `retryPolicy.maxAttempts` (already enforced);
+- exponential backoff between attempts;
 - `retryPolicy.retryRunningAfterCrash`;
 - `retryPolicy.requireApprovalBeforeRetry`;
 - `retrySafe`;
-- `idempotencyKey`;
-- conservative defaults for mutating tools and external agents.
+- idempotency key reaching native agent tools;
+- retry metrics surfaced in evals.
 
-This should happen before workflow scheduling or real business integrations.
+### 2. Workflow scheduling
+
+```bash
+agav workflows schedule add <workflow> "0 9 * * 1-5"
+```
+
+Triggers a versioned workflow run rather than a raw prompt, with run history
+visible through the existing observability surface.
+
+## Known gaps
+
+- run-level `tokenBudget` / `costBudgetUsd` policies are declared but not enforced;
+- agent-node token usage is not captured (only `prompt`/`reduce` nodes report it);
+- metrics are computed on demand, not persisted or aggregated across runs.

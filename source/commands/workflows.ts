@@ -3,7 +3,8 @@ import { getAgent, loadAgents } from "../agents/loader.js";
 import { executeA2AAgent, executeNativeAgent } from "../agents/executor.js";
 import { getSkill } from "../skills/loader.js";
 import { executeSkill } from "../skills/executor.js";
-import { cancelWorkflow, decideWorkflowApproval, getWorkflowRunSummary, pauseWorkflow, retryWorkflowNode } from "../workflows/control.js";
+import { cancelWorkflow, decideWorkflowApproval, getWorkflowRunMetrics, getWorkflowRunSummary, pauseWorkflow, retryWorkflowNode } from "../workflows/control.js";
+import { computeRunMetrics, formatDuration, formatMetrics, nodeDurationMs } from "../workflows/metrics.js";
 import { listWorkflows, loadWorkflow } from "../workflows/loader.js";
 import { loadWorkflowEvals, runWorkflowEvals } from "../workflows/evals.js";
 import { resumeWorkflow, runWorkflow } from "../workflows/runtime.js";
@@ -33,9 +34,17 @@ function formatRun(run: WorkflowRun): string {
 }
 
 function formatNode(node: WorkflowNodeRun): string {
+  const duration = node.startedAt ? formatDuration(nodeDurationMs(node)) : "";
+  const meta = [
+    duration,
+    node.attempt > 1 ? `attempt ${node.attempt}` : "",
+    node.usage ? `${(node.usage.inputTokens ?? 0) + (node.usage.outputTokens ?? 0)} tok` : "",
+    node.dryRun ? "dry-run" : "",
+    node.mocked ? "mocked" : "",
+  ].filter(Boolean).join(", ");
   const icon = node.status === "passed" ? "✓" : node.status === "failed" ? "✗" : node.status === "waiting_approval" ? "?" : node.status === "running" ? "…" : "-";
   const detail = node.error ?? node.summary ?? short(node.output);
-  return `  ${icon} ${node.id.padEnd(20)} ${node.type.padEnd(9)} ${node.status.padEnd(16)} ${short(detail, 100)}`;
+  return `  ${icon} ${node.id.padEnd(20)} ${node.type.padEnd(9)} ${node.status.padEnd(16)} ${short(detail, 60).padEnd(60)} ${meta}`;
 }
 
 function formatPending(node: WorkflowPendingNode): string {
@@ -96,7 +105,9 @@ export const workflowsCommand: SlashCommand = {
   /workflows run <workflow>               Run a workflow
   /workflows dry-run <workflow>           Run without external side effects
   /workflows test <workflow>              Run workflow eval fixtures
-  /workflows status <run-id>              Show a run summary
+  /workflows status <run-id>              Show a run summary with metrics
+  /workflows metrics <run-id>             Show detailed run metrics
+  /workflows logs <run-id> [node-id]     Show recent node logs
   /workflows checkpoints <run-id>         Show node checkpoints and pending nodes
   /workflows attempts <run-id> <node-id>  Show attempt history for a node
   /workflows approve <run-id> <node-id>   Approve a waiting approval node
@@ -120,7 +131,13 @@ export const workflowsCommand: SlashCommand = {
       if (action === "runs") {
         const runs = await store.listRuns();
         if (runs.length === 0) return { type: "message", text: "No workflow runs found." };
-        const lines = runs.map((run) => `  ${run.id}  [${run.status}]  ${run.workflowName}  updated ${new Date(run.updatedAt).toLocaleString()}`);
+        const lines = await Promise.all(runs.map(async (run) => {
+          const summary = await store.getRunSummary(run.id);
+          const metrics = summary ? computeRunMetrics(summary) : undefined;
+          const progress = metrics ? `${metrics.completedNodes}/${metrics.nodeCount + metrics.pendingNodes} done` : "";
+          const duration = metrics ? formatDuration(metrics.durationMs) : "";
+          return `  ${run.id}  [${run.status}]  ${run.workflowName}  ${progress.padEnd(14)} ${duration.padStart(8)}  ${new Date(run.updatedAt).toLocaleString()}`;
+        }));
         return { type: "message", text: `Workflow runs:\n${lines.join("\n")}` };
       }
 
@@ -157,8 +174,25 @@ export const workflowsCommand: SlashCommand = {
       if (!runId) return { type: "message", text: `Usage: /workflows ${action} <run-id>` };
 
       if (action === "status") {
-        const { run } = await getWorkflowRunSummary(runId, store);
-        return { type: "message", text: formatRun(run) };
+        const summary = await getWorkflowRunSummary(runId, store);
+        return { type: "message", text: `${formatRun(summary.run)}
+
+${formatMetrics(computeRunMetrics(summary))}` };
+      }
+
+      if (action === "metrics") {
+        return { type: "message", text: formatMetrics(await getWorkflowRunMetrics(runId, store)) };
+      }
+
+      if (action === "logs") {
+        if (nodeId) {
+          const lines = await store.readLog(runId, nodeId, 100);
+          if (lines.length === 0) return { type: "message", text: `No logs for ${nodeId} in ${runId}.` };
+          return { type: "message", text: lines.join("\n") };
+        }
+        const all = await store.readRunLogs(runId, 20);
+        if (all.length === 0) return { type: "message", text: `No logs found for ${runId}.` };
+        return { type: "message", text: all.map((entry) => `--- ${entry.nodeId} ---\n${entry.lines.join("\n")}`).join("\n") };
       }
 
       if (action === "checkpoints" || action === "nodes") {

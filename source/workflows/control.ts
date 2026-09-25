@@ -1,4 +1,5 @@
 import { hashValue } from "./hash.js";
+import { computeRunMetrics, type WorkflowRunMetrics } from "./metrics.js";
 import { WorkflowStore } from "./store.js";
 import type {
   WorkflowApprovalDecision,
@@ -11,6 +12,14 @@ export async function getWorkflowRunSummary(runId: string, store = new WorkflowS
   const summary = await store.getRunSummary(runId);
   if (!summary) throw new Error(`Workflow run ${runId} not found`);
   return summary;
+}
+
+export async function getWorkflowRunMetrics(
+  runId: string,
+  store = new WorkflowStore(),
+): Promise<WorkflowRunMetrics> {
+  const summary = await getWorkflowRunSummary(runId, store);
+  return computeRunMetrics(summary);
 }
 
 export async function decideWorkflowApproval(
