@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi , type MockedFunction} from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,7 +50,9 @@ describe("workflow agent and skill token usage", () => {
   let store: WorkflowStore;
   let registry: ToolRegistry;
   let provider: MockProvider;
-  let loadAgent: ReturnType<typeof vi.fn>;
+  // Typed to the signature WorkflowRuntimeDeps declares; an untyped vi.fn() mock is
+  // not assignable to it.
+  let loadAgent: MockedFunction<(name: string) => Promise<AgentDefinition | null>>;
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "agav-workflow-usage-"));
