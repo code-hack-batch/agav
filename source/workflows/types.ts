@@ -197,6 +197,20 @@ export interface WorkflowRun {
   error?: string;
 }
 
+/**
+ * Token budget reported by an external agent node.
+ *
+ * External agents run out of process, so their consumption cannot be measured
+ * directly. An agent may report a budget; when it does not,
+ * `usageReported` is false so the gap is visible rather than read as zero.
+ */
+export interface WorkflowTokenBudget {
+  limit?: number;
+  used?: number;
+  remaining?: number;
+  period?: string;
+}
+
 export interface WorkflowNodeRun {
   id: string;
   type: WorkflowNodeType;
@@ -215,6 +229,10 @@ export interface WorkflowNodeRun {
   skippedReason?: string;
   dryRun?: boolean;
   mocked?: boolean;
+  /** For external agent nodes: whether the agent reported usage at all. */
+  usageReported?: boolean;
+  /** Token budget the external agent reported for itself, when provided. */
+  tokenBudget?: WorkflowTokenBudget;
 }
 
 export interface WorkflowPendingNode {

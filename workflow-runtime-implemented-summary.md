@@ -236,6 +236,72 @@ Usage lands on the node checkpoint and folds into `computeRunMetrics`, so
 string or a `{ output, usage }` result, so custom executors written against the
 old contract keep working.
 
+### External (A2A) agent budgets
+
+External agents run out of process, so their token consumption **cannot be
+measured** from here. Rather than invent a number, the runtime distinguishes
+three states:
+
+| State | Meaning |
+| --- | --- |
+| Budget reported | The agent returned a `tokenBudget`; it is displayed |
+| Usage reported | The agent returned `usage`; counts are included |
+| Nothing returned | Flagged explicitly as "no token budget returned" |
+
+An external agent opts in by returning either field in its response metadata:
+
+```json
+{
+  "output": "done",
+  "isError": false,
+  "metadata": {
+    "usage": { "inputTokens": 120, "outputTokens": 40 },
+    "tokenBudget": { "limit": 5000, "used": 160, "period": "run" }
+  }
+}
+```
+
+Alternative field names are accepted (`tokenUsage`, `maxTokens`, `consumed`,
+`left`). Malformed values are ignored rather than reported as real figures.
+
+### APIs
+
+```ts
+hasA2AUsage(metadata): boolean            // false = no report, not zero usage
+readA2ATokenBudget(metadata): A2ATokenBudget | undefined
+formatA2ATokenBudget(budget): string      // "No token budget returned" when absent
+```
+
+Checkpoints record `usageReported` and `tokenBudget`.
+
+### Display
+
+```ts
+formatNodeBudget(node): string   // per-node status
+NO_TOKEN_BUDGET                  // "no token budget returned"
+```
+
+Per-node budget status appears in the checkpoint list on both `agav workflows
+checkpoints` and `/workflows checkpoints`, in the same meta column as duration
+and attempts:
+
+| Node state | Displayed |
+| --- | --- |
+| Reported budget | `limit 5000, used 160, remaining 4840 (run)` |
+| Usage reported, no budget | `60 tok` |
+| Nothing reported (agent) | `! no token budget returned` |
+| Not a model-calling node | *(nothing)* |
+
+`status` additionally prints a warning line when any external agent reported
+nothing:
+
+```text
+Warning: no token budget returned by external agent(s): remote_call
+```
+
+and the metrics rollup ends with either an `External agent budgets:` section or
+a `No token budget returned by external agents:` section.
+
 ## Observability
 
 Added `source/workflows/metrics.ts`, which derives a metrics rollup from a run summary.
@@ -451,6 +517,8 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.budget-display.test.ts` | Per-node budget rendering: reported budget, partial budget, no-budget highlight, measured counts, budget precedence, non-model nodes left blank. |
+| `source/__tests__/workflows.budget-reporting.test.ts` | A2A budget parsing, alternative field names, malformed-value handling, reported vs unreported usage, metrics display and no-budget highlighting. |
 | `source/__tests__/workflows.agent-usage.test.ts` | Agent/skill usage recording, string-result backward compatibility, metrics folding, usage normalization, A2A metadata parsing. |
 | `source/__tests__/workflows.retry-hardening.test.ts` | Retry decision table, attempt budgets, backoff math, automatic retry-until-success, exhaustion, operator reset after exhaustion, timeout retry, dry-run safety. |
 | `source/__tests__/workflows.observability.test.ts` | Node status counts, token aggregation, attempt/retried tracking, dry-run/mock flags, per-type and slowest-node timing, duration formatting, log reading, node timing regression. |
@@ -493,4 +561,4 @@ checked. Enforce them against the usage metrics the observability layer
 already computes, so a runaway agent node stops the run instead of silently
 overspending.
 
-## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced.,  All model-calling node types now report usage, so the accounting needed to,  enforce them is in place.,- cost estimation requires a per-model price table; only raw token counts are,  available today;,- A2A agents that do not report usage in metadata still record zero. They must,  opt in by returning `usage` in their response;,- metrics are computed on demand, not persisted or aggregated across runs;,- cancellation remains cooperative: a tool that ignores `AbortSignal` keeps,  running even after its node is checkpointed as cancelled or timed out.,
+## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced.,  All in-process model-calling node types now report usage, so the accounting,  needed to enforce them is in place. External (A2A) agents are reported but,  cannot be enforced, because their consumption is not observable from here;,- cost estimation requires a per-model price table; only raw token counts are,  available today;,- external agents that return neither `usage` nor `tokenBudget` are flagged,  rather than treated as zero-token calls;,- metrics are computed on demand, not persisted or aggregated across runs;,- cancellation remains cooperative: a tool that ignores `AbortSignal` keeps,  running even after its node is checkpointed as cancelled or timed out.,

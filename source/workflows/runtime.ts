@@ -28,6 +28,7 @@ import type {
   WorkflowTestNode,
   WorkflowToolNode,
   WorkflowUsage,
+  WorkflowTokenBudget,
 } from "./types.js";
 import { backoffDelayMs, effectiveMaxAttempts, resolveRetryDecision, shouldRetryNode } from "./retry.js";
 import { validateWorkflow } from "./validator.js";
@@ -54,6 +55,10 @@ const DRY_RUN_SAFE_TOOLS = new Set([
 export interface WorkflowAgentResult {
   output: string;
   usage?: WorkflowUsage;
+  /** For external agents: whether the agent reported usage at all. */
+  usageReported?: boolean;
+  /** Token budget the external agent reported for itself, when provided. */
+  tokenBudget?: WorkflowTokenBudget;
 }
 
 export interface AgentExecutionOptions {
@@ -403,8 +408,16 @@ async function executeAgentNode(
   if (!agent) return makeNodeRun(node, "failed", deps, { attempt, input: task, error: `Unknown agent: ${node.agent}` });
 
   const result = await deps.executeAgent(agent, task, executionOptions(run, node, deps, options));
-  const { output, usage } = normalizeAgentResult(result);
-  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: task, output, usage, summary: summarizeOutput(output) }));
+  const { output, usage, usageReported, tokenBudget } = normalizeAgentResult(result);
+  return withValidatedOutput(node, makeNodeRun(node, "passed", deps, {
+    attempt,
+    input: task,
+    output,
+    usage,
+    usageReported,
+    tokenBudget,
+    summary: summarizeOutput(output),
+  }));
 }
 
 async function executeToolNode(
@@ -927,7 +940,12 @@ async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  * Accept executors that return a plain string (older callers) or a result
  * carrying token usage.
  */
-function normalizeAgentResult(result: string | WorkflowAgentResult): { output: string; usage?: WorkflowUsage } {
+function normalizeAgentResult(result: string | WorkflowAgentResult): {
+  output: string;
+  usage?: WorkflowUsage;
+  usageReported?: boolean;
+  tokenBudget?: WorkflowTokenBudget;
+} {
   if (typeof result === "string") return { output: result };
   const usage = result.usage
     ? {
@@ -937,7 +955,7 @@ function normalizeAgentResult(result: string | WorkflowAgentResult): { output: s
         cacheWriteTokens: result.usage.cacheWriteTokens ?? 0,
       }
     : undefined;
-  return { output: result.output, usage };
+  return { output: result.output, usage, usageReported: result.usageReported, tokenBudget: result.tokenBudget };
 }
 
 function makeNodeRun(

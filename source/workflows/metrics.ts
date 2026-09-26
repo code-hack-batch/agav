@@ -38,6 +38,10 @@ export interface WorkflowRunMetrics {
   totalTokens: number;
   byType: WorkflowNodeTypeMetric[];
   slowestNodes: Array<{ id: string; durationMs: number }>;
+  /** External agent nodes that reported no usage at all. */
+  unreportedUsageNodes: string[];
+  /** Token budgets reported by external agents. */
+  reportedBudgets: Array<{ nodeId: string; limit?: number; used?: number; remaining?: number; period?: string }>;
 }
 
 export function computeRunMetrics(summary: WorkflowRunSummary, now = new Date()): WorkflowRunMetrics {
@@ -57,6 +61,8 @@ export function computeRunMetrics(summary: WorkflowRunSummary, now = new Date())
   let mockedNodes = 0;
   const retriedNodes: WorkflowRetryMetric[] = [];
   const durations: Array<{ id: string; durationMs: number }> = [];
+  const unreportedUsageNodes: string[] = [];
+  const reportedBudgets: WorkflowRunMetrics["reportedBudgets"] = [];
 
   for (const node of nodes) {
     const durationMs = nodeDurationMs(node, now);
@@ -79,6 +85,11 @@ export function computeRunMetrics(summary: WorkflowRunSummary, now = new Date())
 
     if (node.dryRun) dryRunNodes += 1;
     if (node.mocked) mockedNodes += 1;
+
+    // An external agent that reports no usage is flagged rather than
+    // silently counted as zero.
+    if (node.usageReported === false) unreportedUsageNodes.push(node.id);
+    if (node.tokenBudget) reportedBudgets.push({ nodeId: node.id, ...node.tokenBudget });
   }
 
   return {
@@ -107,6 +118,8 @@ export function computeRunMetrics(summary: WorkflowRunSummary, now = new Date())
     totalTokens: inputTokens + outputTokens,
     byType: [...typeMap.values()].sort((a, b) => b.durationMs - a.durationMs),
     slowestNodes: durations.sort((a, b) => b.durationMs - a.durationMs).slice(0, 5),
+    unreportedUsageNodes,
+    reportedBudgets,
   };
 }
 
@@ -124,6 +137,41 @@ function runDurationMs(createdAt: string, updatedAt: string, now: Date): number 
   const end = Date.parse(updatedAt);
   const resolved = Number.isNaN(end) ? now.getTime() : end;
   return Math.max(0, resolved - start);
+}
+
+function formatBudget(budget: { limit?: number; used?: number; remaining?: number; period?: string }): string {
+  const parts: string[] = [];
+  if (budget.limit !== undefined) parts.push(`limit ${budget.limit}`);
+  if (budget.used !== undefined) parts.push(`used ${budget.used}`);
+  if (budget.remaining !== undefined) parts.push(`remaining ${budget.remaining}`);
+  if (parts.length === 0) return NO_TOKEN_BUDGET;
+  const summary = parts.join(", ");
+  return budget.period ? `${summary} (${budget.period})` : summary;
+}
+
+/** Marker shown when an external agent reported no token budget at all. */
+export const NO_TOKEN_BUDGET = "no token budget returned";
+
+/**
+ * Per-node budget status for status/checkpoint views.
+ *
+ * In-process nodes always have measured usage, so they show counts. External
+ * nodes show their reported budget, or an explicit marker when the agent
+ * reported nothing — never a fabricated zero.
+ */
+export function formatNodeBudget(node: Pick<WorkflowNodeRun, "type" | "usage" | "usageReported" | "tokenBudget">): string {
+  if (node.tokenBudget) return formatBudget(node.tokenBudget);
+
+  if (node.usageReported === false) {
+    return node.type === "agent" ? `! ${NO_TOKEN_BUDGET}` : NO_TOKEN_BUDGET;
+  }
+
+  if (node.usage) {
+    const total = (node.usage.inputTokens ?? 0) + (node.usage.outputTokens ?? 0);
+    return `${total} tok`;
+  }
+
+  return "";
 }
 
 export function formatDuration(ms: number): string {
@@ -187,6 +235,20 @@ export function formatMetrics(metrics: WorkflowRunMetrics): string {
     lines.push("", "Slowest nodes:");
     for (const entry of metrics.slowestNodes) {
       lines.push(`  ${entry.id.padEnd(24)} ${formatDuration(entry.durationMs)}`);
+    }
+  }
+
+  if (metrics.reportedBudgets.length > 0) {
+    lines.push("", "External agent budgets:");
+    for (const budget of metrics.reportedBudgets) {
+      lines.push(`  ${budget.nodeId.padEnd(24)} ${formatBudget(budget)}`);
+    }
+  }
+
+  if (metrics.unreportedUsageNodes.length > 0) {
+    lines.push("", "No token budget returned by external agents:");
+    for (const nodeId of metrics.unreportedUsageNodes) {
+      lines.push(`  ! ${nodeId} — external agent reported no usage`);
     }
   }
 

@@ -24,6 +24,13 @@ export interface AgentRunUsage {
 export interface AgentRunResult {
   output: string;
   usage: AgentRunUsage;
+  /**
+   * For external (A2A) agents: whether the agent actually reported usage.
+   * False means the agent returned nothing, not that it used zero tokens.
+   */
+  usageReported?: boolean;
+  /** Token budget the external agent reported for itself, when provided. */
+  tokenBudget?: { limit?: number; used?: number; remaining?: number; period?: string };
 }
 
 export function emptyAgentUsage(): AgentRunUsage {
@@ -242,7 +249,12 @@ export async function executeA2AAgentDetailed(
   const { executeA2AAgentDetailed: a2aExecute } = await import("./a2a-client.js");
 
   const result = await a2aExecute(agent, task, options.context, options.signal);
-  return { output: result.output, usage: result.usage };
+  return {
+    output: result.output,
+    usage: result.usage,
+    usageReported: result.usageReported,
+    tokenBudget: result.tokenBudget,
+  };
 }
 
 /**

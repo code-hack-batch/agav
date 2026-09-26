@@ -4,7 +4,7 @@ import { executeA2AAgentDetailed, executeNativeAgentDetailed } from "../agents/e
 import { getSkill } from "../skills/loader.js";
 import { executeSkill } from "../skills/executor.js";
 import { cancelWorkflow, decideWorkflowApproval, getWorkflowRunMetrics, getWorkflowRunSummary, pauseWorkflow, retryWorkflowNode } from "../workflows/control.js";
-import { computeRunMetrics, formatDuration, formatMetrics, nodeDurationMs } from "../workflows/metrics.js";
+import { computeRunMetrics, formatDuration, formatMetrics, formatNodeBudget, nodeDurationMs } from "../workflows/metrics.js";
 import { listWorkflows, loadWorkflow } from "../workflows/loader.js";
 import { loadWorkflowEvals, runWorkflowEvals } from "../workflows/evals.js";
 import { resumeWorkflow, runWorkflow } from "../workflows/runtime.js";
@@ -18,7 +18,7 @@ function short(text: unknown, max = 120): string {
   return value.length > max ? `${value.slice(0, max)}…` : value;
 }
 
-function formatRun(run: WorkflowRun): string {
+function formatRun(run: WorkflowRun, unreportedBudgetNodes: string[] = []): string {
   return [
     `Workflow ${run.id} — ${run.workflowName}`,
     `Status: ${run.status}`,
@@ -29,6 +29,9 @@ function formatRun(run: WorkflowRun): string {
     `Waiting approval: ${run.waitingApprovalNodeIds.join(", ") || "none"}`,
     `Failed: ${run.failedNodeIds.join(", ") || "none"}`,
     `Current: ${run.currentNodeIds.join(", ") || "none"}`,
+    unreportedBudgetNodes.length > 0
+      ? `Warning: no token budget returned by external agent(s): ${unreportedBudgetNodes.join(", ")}`
+      : undefined,
     run.error ? `Error: ${run.error}` : undefined,
   ].filter(Boolean).join("\n");
 }
@@ -38,7 +41,7 @@ function formatNode(node: WorkflowNodeRun): string {
   const meta = [
     duration,
     node.attempt > 1 ? `attempt ${node.attempt}` : "",
-    node.usage ? `${(node.usage.inputTokens ?? 0) + (node.usage.outputTokens ?? 0)} tok` : "",
+    formatNodeBudget(node),
     node.dryRun ? "dry-run" : "",
     node.mocked ? "mocked" : "",
   ].filter(Boolean).join(", ");
@@ -63,11 +66,11 @@ async function executeWorkflowAgent(
   context: CommandContext,
   signal?: AbortSignal,
   idempotencyKey?: string,
-): Promise<{ output: string; usage?: import("../workflows/types.js").WorkflowUsage }> {
+): Promise<import("../workflows/runtime.js").WorkflowAgentResult> {
   const a2aContext = idempotencyKey ? { idempotencyKey } : undefined;
   if (agent.manifest.type === "a2a") {
     const result = await executeA2AAgentDetailed(agent, task, { signal, context: a2aContext });
-    return { output: result.output, usage: result.usage };
+    return { output: result.output, usage: result.usage, usageReported: result.usageReported, tokenBudget: result.tokenBudget };
   }
   if (!context.provider) throw new Error("Cannot run native agent workflow without an active provider");
   const result = await executeNativeAgentDetailed(agent, task, {
@@ -186,7 +189,7 @@ export const workflowsCommand: SlashCommand = {
 
       if (action === "status") {
         const summary = await getWorkflowRunSummary(runId, store);
-        return { type: "message", text: `${formatRun(summary.run)}
+        return { type: "message", text: `${formatRun(summary.run, computeRunMetrics(summary).unreportedUsageNodes)}
 
 ${formatMetrics(computeRunMetrics(summary))}` };
       }

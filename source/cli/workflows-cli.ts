@@ -11,7 +11,7 @@ import { runWorkflow, resumeWorkflow } from "../workflows/runtime.js";
 import { loadWorkflowEvals, runWorkflowEvals } from "../workflows/evals.js";
 import { WorkflowStore } from "../workflows/store.js";
 import { cancelWorkflow, decideWorkflowApproval, getWorkflowRunMetrics, getWorkflowRunSummary, pauseWorkflow, retryWorkflowNode } from "../workflows/control.js";
-import { computeRunMetrics, formatDuration, formatMetrics, nodeDurationMs } from "../workflows/metrics.js";
+import { computeRunMetrics, formatDuration, formatMetrics, formatNodeBudget, nodeDurationMs } from "../workflows/metrics.js";
 import type { AgentDefinition } from "../agents/types.js";
 import type { WorkflowDefinition, WorkflowNodeRun, WorkflowPendingNode, WorkflowRun } from "../workflows/types.js";
 import { getSkill } from "../skills/loader.js";
@@ -75,7 +75,7 @@ async function makeRuntimeDeps() {
       const context = execOptions.idempotencyKey ? { idempotencyKey: execOptions.idempotencyKey } : undefined;
       if (agent.manifest.type === "a2a") {
         const result = await executeA2AAgentDetailed(agent, task, { signal: execOptions.signal, context });
-        return { output: result.output, usage: result.usage };
+        return { output: result.output, usage: result.usage, usageReported: result.usageReported, tokenBudget: result.tokenBudget };
       }
       return executeNativeAgentDetailed(agent, task, { provider, config, signal: execOptions.signal });
     },
@@ -96,7 +96,7 @@ async function makeRuntimeDeps() {
   };
 }
 
-function formatRun(run: WorkflowRun): string {
+function formatRun(run: WorkflowRun, unreportedBudgetNodes: string[] = []): string {
   return [
     `Workflow ${run.id} — ${run.workflowName}`,
     `Status: ${run.status}`,
@@ -106,6 +106,9 @@ function formatRun(run: WorkflowRun): string {
     `Waiting approval: ${run.waitingApprovalNodeIds.join(", ") || "none"}`,
     `Failed: ${run.failedNodeIds.join(", ") || "none"}`,
     `Current: ${run.currentNodeIds.join(", ") || "none"}`,
+    unreportedBudgetNodes.length > 0
+      ? `Warning: no token budget returned by external agent(s): ${unreportedBudgetNodes.join(", ")}`
+      : undefined,
     run.error ? `Error: ${run.error}` : undefined,
   ].filter(Boolean).join("\n");
 }
@@ -117,7 +120,7 @@ function formatNode(node: WorkflowNodeRun): string {
   const meta = [
     duration,
     node.attempt > 1 ? `attempt ${node.attempt}` : "",
-    node.usage ? `${(node.usage.inputTokens ?? 0) + (node.usage.outputTokens ?? 0)} tok` : "",
+    formatNodeBudget(node),
     node.dryRun ? "dry-run" : "",
     node.mocked ? "mocked" : "",
   ].filter(Boolean).join(", ");
@@ -227,7 +230,8 @@ export async function runWorkflowsCommand(command: string | undefined, args: str
       const id = args[0];
       if (!id) { printUsage(); return 1; }
       const summary = await getWorkflowRunSummary(id, store);
-      console.log(formatRun(summary.run));
+      const metrics = computeRunMetrics(summary);
+      console.log(formatRun(summary.run, metrics.unreportedUsageNodes));
       console.log("");
       console.log(formatMetrics(computeRunMetrics(summary)));
       return 0;
