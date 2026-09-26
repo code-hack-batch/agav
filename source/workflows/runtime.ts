@@ -155,6 +155,11 @@ async function executeWorkflowRun(
   run.updatedAt = isoNow(deps);
   await store.saveRun(run);
 
+
+  // Run-level deadline. Unlike a node timeout, this bounds the whole run so a
+  // slow loop or long chain cannot execute indefinitely. It is wall-clock time
+  // from the moment execution starts, so it also covers retry backoff.
+  const runDeadline = createRunDeadline(run, deps);
   // Only top-level nodes are scheduled by the run loop. Nested `parallel`
   // children are owned and scheduled by their parent node, so they must not
   // be treated as independent run-level nodes here.
@@ -172,6 +177,7 @@ async function executeWorkflowRun(
 
   while (true) {
     if (activeSignal(deps, options)?.aborted) return saveRunStatus(run, store, deps, "paused", "Workflow paused by signal");
+    if (runDeadline.expired()) return expireRun(run, store, deps, runDeadline);
 
     // A full pass that changes no node state means the scheduler cannot make
     // further progress. Bail out instead of spinning forever.
@@ -211,7 +217,7 @@ async function executeWorkflowRun(
     await store.saveRun(run);
 
     await Promise.all(batch.map(async (node) => {
-      const result = await executeNode(run, node, deps, store, options).catch(async (error: unknown) => {
+      const result = await executeNode(run, node, deps, store, options, runDeadline).catch(async (error: unknown) => {
         const attempt = await store.nextNodeAttempt(run.id, node.id);
         const failed = makeNodeRun(node, "failed", deps, { attempt, error: error instanceof Error ? error.message : String(error) });
         await store.saveNode(run.id, failed);
@@ -241,6 +247,10 @@ async function executeWorkflowRun(
       run.currentNodeIds = [];
       return saveRunStatus(run, store, deps, "waiting_approval");
     }
+
+    // A node that ran out of run budget did not fail on its own merits; let
+    // the deadline check below report the run as `timed_out` instead.
+    if (runDeadline.expired()) return expireRun(run, store, deps, runDeadline);
 
     if ((run.policies.stopOnFailure ?? true) && [...failedThisRun].some((id) => isTerminalFailure(allNodes, id))) {
       const terminal = summarizeTerminalState(allNodes, await store.loadNodes(run.id));
@@ -302,6 +312,7 @@ async function executeNode(
   deps: WorkflowRuntimeDeps,
   store: WorkflowStore,
   options: WorkflowRunOptions,
+  deadline?: RunDeadline,
 ): Promise<WorkflowNodeRun> {
   const attempt = await store.nextNodeAttempt(run.id, node.id);
   const existing = await store.loadNode(run.id, node.id);
@@ -382,7 +393,7 @@ async function executeNode(
     }
   };
 
-  const result = await withNodeTimeout(executeCurrentNode(), run, node, deps, attempt, options);
+  const result = await withNodeTimeout(executeCurrentNode(), run, node, deps, attempt, options, deadline);
 
   // Preserve the start timestamp captured before execution so metrics and
   // status views report real elapsed time instead of a zero-length window.
@@ -1044,6 +1055,72 @@ function summarizeOutput(output: unknown): string {
   return text.length > 500 ? `${text.slice(0, 500)}\n...(truncated)` : text;
 }
 
+interface RunDeadline {
+  /** Wall-clock expiry in epoch ms, or undefined when the run is unbounded. */
+  expiresAt?: number;
+  /** True when a budget is configured, even if it has not yet elapsed. */
+  bounded: boolean;
+  expired(): boolean;
+  remainingMs(): number | undefined;
+}
+
+/**
+ * Build the run-level deadline from `policies.maxRuntimeSeconds`.
+ *
+ * The clock starts when the run begins executing, so a resumed run gets a
+ * fresh budget rather than inheriting time already spent in a prior process.
+ */
+function createRunDeadline(run: WorkflowRun, deps: WorkflowRuntimeDeps): RunDeadline {
+  const maxSeconds = run.policies.maxRuntimeSeconds;
+  if (!maxSeconds || maxSeconds <= 0) {
+    return { bounded: false, expired: () => false, remainingMs: () => undefined };
+  }
+  const now = (deps.now?.() ?? new Date()).getTime();
+  const expiresAt = now + maxSeconds * 1000;
+  const read = (): number => (deps.now?.() ?? new Date()).getTime();
+  return {
+    bounded: true,
+    expiresAt,
+    expired: () => read() >= expiresAt,
+    remainingMs: () => Math.max(0, expiresAt - read()),
+  };
+}
+
+/**
+ * Mark a run as timed out, checkpointing any node that was still in flight as
+ * `timed_out` so the partial state is inspectable and resumable.
+ */
+async function expireRun(
+  run: WorkflowRun,
+  store: WorkflowStore,
+  deps: WorkflowRuntimeDeps,
+  deadline: RunDeadline,
+): Promise<WorkflowRun> {
+  const limit = run.policies.maxRuntimeSeconds;
+  const message = `Workflow exceeded maxRuntimeSeconds (${limit})`;
+
+  const checkpoints = await store.loadNodes(run.id);
+  for (const node of run.definition.nodes) {
+    const checkpoint = checkpoints[node.id];
+    if (checkpoint?.status === "running") {
+      await store.saveNode(run.id, {
+        ...checkpoint,
+        status: "timed_out",
+        endedAt: isoNow(deps),
+        error: message,
+      });
+    }
+  }
+
+  const latest = await store.loadNodes(run.id);
+  const terminal = summarizeTerminalState(run.definition.nodes, latest);
+  run.completedNodeIds = terminal.completed;
+  run.failedNodeIds = terminal.failed;
+  run.waitingApprovalNodeIds = terminal.waiting;
+  run.currentNodeIds = [];
+
+  return saveRunStatus(run, store, deps, "timed_out", message);
+}
 function summarizeTerminalState(nodes: WorkflowNodeDefinition[], checkpoints: Record<string, WorkflowNodeRun>) {
   return {
     completed: nodes.filter((node) => checkpoints[node.id]?.status === "passed").map((node) => node.id),
@@ -1085,19 +1162,36 @@ async function withNodeTimeout(
   deps: WorkflowRuntimeDeps,
   attempt: number,
   options: WorkflowRunOptions,
+  deadline?: RunDeadline,
 ): Promise<WorkflowNodeRun> {
-  const timeoutSeconds = node.timeoutSeconds ?? run.policies.maxNodeRuntimeSeconds;
-  if (!timeoutSeconds || timeoutSeconds <= 0) return promise;
+  const nodeSeconds = node.timeoutSeconds ?? run.policies.maxNodeRuntimeSeconds;
+
+  // A node may never outlive the run. When the run has a deadline, the
+  // remaining budget caps the node, so a single slow node or a long loop
+  // iteration cannot push the run past its ceiling.
+  const remainingMs = deadline?.bounded ? deadline.remainingMs() : undefined;
+  const effectiveMs = Math.min(
+    nodeSeconds !== undefined && nodeSeconds > 0 ? nodeSeconds * 1000 : Number.POSITIVE_INFINITY,
+    remainingMs ?? Number.POSITIVE_INFINITY,
+  );
+
+  if (!Number.isFinite(effectiveMs) || effectiveMs <= 0) return promise;
+
+  const runCapped = remainingMs !== undefined && remainingMs <= (nodeSeconds ?? Number.POSITIVE_INFINITY) * 1000;
+  const error = runCapped
+    ? `Workflow exceeded maxRuntimeSeconds (${run.policies.maxRuntimeSeconds})`
+    : `Node timed out after ${nodeSeconds} seconds`;
 
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<WorkflowNodeRun>((resolve) => {
     timeout = setTimeout(() => {
       resolve(makeNodeRun(node, "timed_out", deps, {
         attempt,
-        error: `Node timed out after ${timeoutSeconds} seconds`,
+        error,
+        timedOutBy: runCapped ? "run" : "node",
         dryRun: options.dryRun === true,
       }));
-    }, timeoutSeconds * 1000);
+    }, effectiveMs);
     timeout.unref?.();
   });
 

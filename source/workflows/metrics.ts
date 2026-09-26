@@ -17,6 +17,10 @@ export interface WorkflowRunMetrics {
   workflowName: string;
   status: string;
   durationMs: number;
+  /** Configured run-level ceiling in seconds, when bounded. */
+  maxRuntimeSeconds?: number;
+  /** True when the run hit its ceiling rather than finishing or failing. */
+  runtimeExceeded: boolean;
   nodeCount: number;
   completedNodes: number;
   failedNodes: number;
@@ -97,6 +101,8 @@ export function computeRunMetrics(summary: WorkflowRunSummary, now = new Date())
     workflowName: run.workflowName,
     status: run.status,
     durationMs: runDurationMs(run.createdAt, run.updatedAt, now),
+    maxRuntimeSeconds: run.policies.maxRuntimeSeconds,
+    runtimeExceeded: run.status === "timed_out",
     nodeCount: nodes.length,
     completedNodes: byStatus.get("passed") ?? 0,
     failedNodes: (byStatus.get("failed") ?? 0) + (byStatus.get("timed_out") ?? 0),
@@ -189,7 +195,11 @@ export function formatMetrics(metrics: WorkflowRunMetrics): string {
   const lines: string[] = [
     `Metrics for ${metrics.runId} — ${metrics.workflowName}`,
     `Status: ${metrics.status}`,
-    `Duration: ${formatDuration(metrics.durationMs)}`,
+    `Duration: ${formatDuration(metrics.durationMs)}` +
+      (metrics.maxRuntimeSeconds
+        ? ` (limit ${formatDuration(metrics.maxRuntimeSeconds * 1000)})`
+        : ""),
+    ...(metrics.runtimeExceeded ? ["", "Run exceeded its maxRuntimeSeconds ceiling."] : []),
     "",
     `Nodes: ${metrics.nodeCount} total` +
       ` | ${metrics.completedNodes} passed` +

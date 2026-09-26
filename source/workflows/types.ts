@@ -224,6 +224,11 @@ export interface WorkflowNodeRun {
   summary?: string;
   usage?: WorkflowUsage;
   error?: string;
+  /**
+   * Which ceiling ended this node, when it timed out. Lets callers tell a
+   * node's own timeout apart from the run-level `maxRuntimeSeconds` budget.
+   */
+  timedOutBy?: "node" | "run";
   approval?: WorkflowApprovalDecision;
   artifacts?: string[];
   skippedReason?: string;

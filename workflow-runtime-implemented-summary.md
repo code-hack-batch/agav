@@ -302,6 +302,34 @@ Warning: no token budget returned by external agent(s): remote_call
 and the metrics rollup ends with either an `External agent budgets:` section or
 a `No token budget returned by external agents:` section.
 
+## Run-level runtime ceiling
+
+`policies.maxRuntimeSeconds` bounds the whole run. Previously the field was
+declared but never read, so a long `loop` or slow chain could run indefinitely.
+
+### Behavior
+
+- The clock starts when the run begins executing, so a **resumed run gets a
+  fresh budget** rather than inheriting time already spent in a prior process.
+- A node's effective timeout is `min(node timeout, remaining run budget)`, so a
+  single slow node or one loop iteration cannot push the run past its ceiling.
+- The run terminates as **`timed_out`**, distinct from `failed`.
+- Any node still `running` when the ceiling hits is checkpointed as
+  `timed_out` with an `endedAt`, leaving partial state inspectable and resumable.
+- A node cut short by the run budget is tagged `timedOutBy: "run"`, so it is
+  not miscounted as a genuine failure. A node that hit its own timeout is
+  tagged `timedOutBy: "node"` and still fails the run normally.
+- `0` or negative values are ignored, leaving the run unbounded.
+
+```yaml
+policies:
+  maxRuntimeSeconds: 300
+  maxNodeRuntimeSeconds: 60
+```
+
+Metrics surface `maxRuntimeSeconds` and `runtimeExceeded`, and the report prints
+`Run exceeded its maxRuntimeSeconds ceiling.`
+
 ## Observability
 
 Added `source/workflows/metrics.ts`, which derives a metrics rollup from a run summary.
@@ -517,6 +545,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.run-deadline.test.ts` | Run ceiling enforcement, in-flight node checkpointing, node-vs-run timeout attribution, loop bounding, resumability, unbounded/zero-limit behavior, metrics reporting. |
 | `source/__tests__/workflows.budget-display.test.ts` | Per-node budget rendering: reported budget, partial budget, no-budget highlight, measured counts, budget precedence, non-model nodes left blank. |
 | `source/__tests__/workflows.budget-reporting.test.ts` | A2A budget parsing, alternative field names, malformed-value handling, reported vs unreported usage, metrics display and no-budget highlighting. |
 | `source/__tests__/workflows.agent-usage.test.ts` | Agent/skill usage recording, string-result backward compatibility, metrics folding, usage normalization, A2A metadata parsing. |
@@ -561,4 +590,4 @@ checked. Enforce them against the usage metrics the observability layer
 already computes, so a runaway agent node stops the run instead of silently
 overspending.
 
-## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced.,  All in-process model-calling node types now report usage, so the accounting,  needed to enforce them is in place. External (A2A) agents are reported but,  cannot be enforced, because their consumption is not observable from here;,- cost estimation requires a per-model price table; only raw token counts are,  available today;,- external agents that return neither `usage` nor `tokenBudget` are flagged,  rather than treated as zero-token calls;,- metrics are computed on demand, not persisted or aggregated across runs;,- cancellation remains cooperative: a tool that ignores `AbortSignal` keeps,  running even after its node is checkpointed as cancelled or timed out.,
+## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced.,  All in-process model-calling node types now report usage, and runs are bounded,  by `maxRuntimeSeconds`, so both the accounting and a wall-clock ceiling are in,  place. External (A2A) agents are reported but cannot be enforced, because,  their consumption is not observable from here;,- cost estimation requires a per-model price table; only raw token counts are,  available today;,- external agents that return neither `usage` nor `tokenBudget` are flagged,  rather than treated as zero-token calls;,- metrics are computed on demand, not persisted or aggregated across runs;,- cancellation remains cooperative: a tool that ignores `AbortSignal` keeps,  running even after its node is checkpointed as cancelled or timed out. The,  run ceiling therefore bounds how long the run waits, not how long a,  non-cooperative tool keeps executing in the background.,
