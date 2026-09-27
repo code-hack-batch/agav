@@ -330,6 +330,59 @@ policies:
 Metrics surface `maxRuntimeSeconds` and `runtimeExceeded`, and the report prints
 `Run exceeded its maxRuntimeSeconds ceiling.`
 
+## Clean shutdown and restart
+
+Cancellation was previously checked at scattered call sites, so a tool that ignored its
+signal was abandoned mid-flight: its node was checkpointed `cancelled` while the promise
+kept running, and the process had no way to exit cleanly.
+
+### RunController
+
+```ts
+createRunController(parent?: AbortSignal): RunController
+```
+
+| Member | Purpose |
+| --- | --- |
+| `signal` | Passed to every tool, agent, and skill so they can stop early |
+| `abort(reason)` | Aborts once; the first reason wins |
+| `track(work)` | Registers in-flight node work |
+| `settle(graceMs)` | Waits for that work, bounded; reports what was abandoned |
+
+### Shutdown sequence
+
+1. Abort the run controller, signalling every in-flight node.
+2. `settle()` waits up to `options.shutdownGraceMs` (default 5000ms).
+3. Nodes still `running` are checkpointed `cancelled`.
+4. The run is saved as `paused` (or `cancelled`), leaving it resumable.
+5. If work outlived the grace period, `onShutdownWarning` reports it rather than exiting silently.
+
+The scheduler no longer blocks on a batch that ignores its signal, so the grace period can
+actually bound a stuck tool instead of hanging indefinitely.
+
+### Cancelled is not failed
+
+A node stopped by shutdown is interrupted, not failed. It is deliberately excluded from:
+
+- `stopOnFailure`, so a stopped run is never reported as `failed`;
+- `summarizeTerminalState().failed`, which reports it separately as `cancelled`;
+- retry policy and attempt budgets, so it always re-runs on resume;
+
+`nonRetryableStatuses` still wins, so an explicit policy opt-out is honoured.
+
+A resumed run clears the previous stop reason and starts with a fresh `maxRuntimeSeconds` budget.
+
+### Tool context
+
+```ts
+ToolContext { env?, idempotencyKey?, signal? }
+ToolRegistry.execute(name, input, context?)
+```
+
+Tools invoked by a workflow node receive the run signal and an idempotency key, so they can
+stop promptly and deduplicate side effects across retries. The agent loop still invokes tools
+without a context, so `execute` only forwards a second argument when one is supplied.
+
 ## Observability
 
 Added `source/workflows/metrics.ts`, which derives a metrics rollup from a run summary.
@@ -545,6 +598,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.shutdown.test.ts` | Run controller abort/reason/parent semantics, work tracking and grace-period drain, stop checkpointing, abandonment warning, resume with a fresh signal, refusal to resume a dead signal, fresh budget on resume. |
 | `source/__tests__/workflows.run-deadline.test.ts` | Run ceiling enforcement, in-flight node checkpointing, node-vs-run timeout attribution, loop bounding, resumability, unbounded/zero-limit behavior, metrics reporting. |
 | `source/__tests__/workflows.budget-display.test.ts` | Per-node budget rendering: reported budget, partial budget, no-budget highlight, measured counts, budget precedence, non-model nodes left blank. |
 | `source/__tests__/workflows.budget-reporting.test.ts` | A2A budget parsing, alternative field names, malformed-value handling, reported vs unreported usage, metrics display and no-budget highlighting. |
@@ -590,4 +644,4 @@ checked. Enforce them against the usage metrics the observability layer
 already computes, so a runaway agent node stops the run instead of silently
 overspending.
 
-## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced.,  All in-process model-calling node types now report usage, and runs are bounded,  by `maxRuntimeSeconds`, so both the accounting and a wall-clock ceiling are in,  place. External (A2A) agents are reported but cannot be enforced, because,  their consumption is not observable from here;,- cost estimation requires a per-model price table; only raw token counts are,  available today;,- external agents that return neither `usage` nor `tokenBudget` are flagged,  rather than treated as zero-token calls;,- metrics are computed on demand, not persisted or aggregated across runs;,- cancellation remains cooperative: a tool that ignores `AbortSignal` keeps,  running even after its node is checkpointed as cancelled or timed out. The,  run ceiling therefore bounds how long the run waits, not how long a,  non-cooperative tool keeps executing in the background.,
+## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced. All,  in-process model-calling node types now report usage, and runs are bounded by,  `maxRuntimeSeconds`, so both the accounting and a wall-clock ceiling are in place.,  External (A2A) agents are reported but cannot be enforced, because their consumption,  is not observable from here;,- cost estimation requires a per-model price table; only raw token counts are available;,- external agents that return neither `usage` nor `tokenBudget` are flagged rather than,  treated as zero-token calls;,- a tool that ignores its `AbortSignal` still runs to completion in the background. The,  grace period bounds how long the run waits and the run exits cleanly, but the process,  does not kill the work. Background-process execution should terminate child processes,  rather than abandoning their promises;,- metrics are computed on demand, not persisted or aggregated across runs.,

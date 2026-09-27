@@ -234,11 +234,13 @@ describe("clean shutdown and restart", () => {
           calls++;
           if (calls === 1) {
             await new Promise<void>((resolve) => {
+              // Attach the listener before aborting: the other order can miss
+              // the abort that is meant to release this promise.
               const signal = context?.signal;
-              if (!signal || signal.aborted) return resolve();
+              if (!signal) return resolve();
+              signal.addEventListener("abort", () => resolve(), { once: true });
               // Stop the run through the caller signal once the node is live.
               controller.abort();
-              signal.addEventListener("abort", () => resolve(), { once: true });
             });
           }
           return { output: `done${calls}`, isError: false };

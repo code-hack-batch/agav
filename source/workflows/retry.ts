@@ -63,8 +63,18 @@ export function resolveRetryDecision(ctx: RetryContext): RetryDecision {
     return { action: "execute" };
   }
 
-  // Regular failure / timeout / cancellation.
-  if (previous.status !== "failed" && previous.status !== "timed_out" && previous.status !== "cancelled") {
+  // Interrupted by shutdown rather than failed on its own merits: re-run
+  // independent of retry policy and attempt budget, unless the policy
+  // explicitly opts the status out.
+  if (previous.status === "cancelled") {
+    if (policy.nonRetryableStatuses?.includes(previous.status)) {
+      return { action: "exhausted", reason: `Status ${previous.status} is not retryable` };
+    }
+    return { action: "execute" };
+  }
+
+  // Regular failure / timeout.
+  if (previous.status !== "failed" && previous.status !== "timed_out") {
     return { action: "reuse", reason: `Node is ${previous.status}` };
   }
 

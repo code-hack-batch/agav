@@ -427,11 +427,25 @@ async function executeNode(
     }
   };
 
-  const result = await withNodeTimeout(executeCurrentNode(), run, node, deps, attempt, options, deadline);
+  const work = executeCurrentNode();
+  const tracked = controller ? controller.track(work) : work;
+  const result = await withNodeTimeout(tracked, run, node, deps, attempt, options, deadline);
 
   // Preserve the start timestamp captured before execution so metrics and
   // status views report real elapsed time instead of a zero-length window.
-  const completed = result.startedAt === started.startedAt ? result : { ...result, startedAt: started.startedAt };
+  let completed = result.startedAt === started.startedAt ? result : { ...result, startedAt: started.startedAt };
+
+  // A tool that ignored its signal can return after the run already expired.
+  // Recording that late success would erase the timeout and make an overrun
+  // look like a clean run, so the ceiling wins.
+  if (deadline?.bounded && deadline.expired() && completed.status === "passed") {
+    completed = {
+      ...completed,
+      status: "timed_out",
+      error: `Workflow exceeded maxRuntimeSeconds (${run.policies.maxRuntimeSeconds})`,
+      timedOutBy: "run",
+    };
+  }
 
   await store.saveNode(run.id, completed);
   await trace(store, run.id, node.id, { type: "node_completed", nodeId: node.id, status: completed.status, dryRun: completed.dryRun === true });
