@@ -435,10 +435,15 @@ async function executeNode(
   // status views report real elapsed time instead of a zero-length window.
   let completed = result.startedAt === started.startedAt ? result : { ...result, startedAt: started.startedAt };
 
-  // A tool that ignored its signal can return after the run already expired.
+  // A tool that ignores its signal can return well after the run expired.
   // Recording that late success would erase the timeout and make an overrun
-  // look like a clean run, so the ceiling wins.
-  if (deadline?.bounded && deadline.expired() && completed.status === "passed") {
+  // look like a clean run, so the ceiling wins. This compares the node's own
+  // end time to the ceiling rather than re-reading the clock, so a node that
+  // genuinely finished in budget keeps its result regardless of scheduling.
+  const finishedAt = completed.endedAt ? Date.parse(completed.endedAt) : Number.NaN;
+  const overran = deadline?.bounded === true && deadline.expiresAt !== undefined
+    && Number.isFinite(finishedAt) && finishedAt >= deadline.expiresAt;
+  if (overran && completed.status === "passed" && result.timedOutBy === undefined) {
     completed = {
       ...completed,
       status: "timed_out",

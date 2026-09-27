@@ -163,11 +163,17 @@ describe("run-level maxRuntimeSeconds", () => {
 
   it("stops a long loop at the run ceiling", async () => {
     let iterations = 0;
-    registry.register(tool("tick", async () => {
-      iterations++;
-      await new Promise((resolve) => setTimeout(resolve, 15));
-      return { output: "tick", isError: false };
-    }));
+    // Cooperate with the abort signal, as a well-behaved tool would, so the run
+    // actually stops rather than racing a runaway background loop.
+    registry.register({
+      schema: { name: "tick", description: "tick", inputSchema: { type: "object" } },
+      execute: async (_input, context) => {
+        iterations++;
+        if (context?.signal?.aborted) return { output: "tick", isError: false };
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        return { output: "tick", isError: false };
+      },
+    });
 
     const run = await runWorkflow(workflow([
       { id: "loop", type: "loop", maxIterations: 500, body: [{ id: "tick", type: "tool", tool: "tick" }] },
