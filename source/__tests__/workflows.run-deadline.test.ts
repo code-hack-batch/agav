@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi , type MockedFunction} from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,7 @@ import { ToolRegistry } from "../tools/registry.js";
 import type { LLMProvider, StreamParams } from "../providers/types.js";
 import type { AgavConfig } from "../config/config.js";
 import type { AgentDefinition } from "../agents/types.js";
-import { resumeWorkflow, runWorkflow } from "../workflows/runtime.js";
+import { resumeWorkflow, runWorkflow , type AgentExecutionOptions} from "../workflows/runtime.js";
 import { computeRunMetrics, formatMetrics } from "../workflows/metrics.js";
 import { WorkflowStore } from "../workflows/store.js";
 import type { WorkflowDefinition, WorkflowNodeDefinition, WorkflowPolicies } from "../workflows/types.js";
@@ -49,8 +49,12 @@ describe("run-level maxRuntimeSeconds", () => {
   let store: WorkflowStore;
   let registry: ToolRegistry;
   let provider: MockProvider;
-  let loadAgent: ReturnType<typeof vi.fn>;
-  let executeAgent: ReturnType<typeof vi.fn>;
+  // Typed to the signatures WorkflowRuntimeDeps declares. An untyped vi.fn() mock is
+  // not assignable to those.
+  let loadAgent: MockedFunction<(name: string) => Promise<AgentDefinition | null>>;
+  let executeAgent: MockedFunction<
+    (agent: AgentDefinition, task: string, options: AgentExecutionOptions) => Promise<string>
+  >;
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "agav-workflow-deadline-"));

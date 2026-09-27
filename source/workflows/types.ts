@@ -260,6 +260,12 @@ export interface WorkflowMocks {
 }
 
 export interface WorkflowRunOptions {
+  /**
+   * How long a stopping run waits for in-flight nodes to finish before it
+   * checkpoints them as cancelled and returns. Bounded so a tool that ignores
+   * its abort signal cannot block process exit.
+   */
+  shutdownGraceMs?: number;
   dryRun?: boolean;
   force?: boolean;
   mocks?: WorkflowMocks;

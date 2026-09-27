@@ -156,9 +156,12 @@ export class WorkflowStore {
   }
 }
 
+/** Monotonic counter guaranteeing a unique temp file per atomic write. */
+let atomicWriteSeq = 0;
+
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  const tmp = `${path}.${process.pid}.${atomicWriteSeq++}.tmp`;
   await writeFile(tmp, JSON.stringify(value, null, 2));
   try {
     await rename(tmp, path);

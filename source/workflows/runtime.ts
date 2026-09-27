@@ -35,6 +35,12 @@ import { validateWorkflow } from "./validator.js";
 
 const DEFAULT_MAX_CONCURRENCY = 4;
 const MAX_STUCK_SCHEDULER_PASSES = 3;
+
+/**
+ * Default grace period for a clean stop: long enough for a cooperative tool to
+ * notice its abort signal, short enough not to stall process exit.
+ */
+const DEFAULT_SHUTDOWN_GRACE_MS = 5000;
 const DEFAULT_MAX_ITERATIONS = 3;
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -83,6 +89,11 @@ export interface WorkflowRuntimeDeps {
   toolRegistry: ToolRegistry;
   loadAgent: (name: string) => Promise<AgentDefinition | null>;
   executeAgent: (agent: AgentDefinition, task: string, options: AgentExecutionOptions) => Promise<string | WorkflowAgentResult>;
+  /**
+   * Called when a stopping run had to abandon in-flight work, so a CLI can warn
+   * that something may still be running in the background.
+   */
+  onShutdownWarning?: (message: string) => void;
   executeSkill?: (skill: string, args: string, options: AgentExecutionOptions) => Promise<string | WorkflowAgentResult>;
   confirm?: (request: WorkflowApprovalRequest) => Promise<WorkflowApprovalDecision>;
   confirmTool?: (toolName: string, input: Record<string, unknown>) => Promise<ConfirmResult>;
@@ -128,10 +139,16 @@ export async function resumeWorkflow(
   const store = deps.store ?? new WorkflowStore();
   const run = await store.loadRun(runId);
   if (!run) throw new Error(`Workflow run ${runId} not found`);
-  if (run.status === "paused") run.status = "pending";
+  // An explicitly cancelled run is an operator decision, so it needs `force`.
   if (run.status === "cancelled" && !options.force) {
     throw new Error(`Workflow run ${runId} is cancelled. Use force to resume it anyway.`);
   }
+  if (run.status !== "running") run.status = "pending";
+
+  // Clear the previous stop reason: a resumed run must not report the error that
+  // ended the previous attempt before it has executed anything.
+  run.error = undefined;
+
   return executeWorkflowRun(run, deps, store, options);
 }
 
@@ -160,6 +177,7 @@ async function executeWorkflowRun(
   // slow loop or long chain cannot execute indefinitely. It is wall-clock time
   // from the moment execution starts, so it also covers retry backoff.
   const runDeadline = createRunDeadline(run, deps);
+  const controller = createRunController(activeSignal(deps, options));
   // Only top-level nodes are scheduled by the run loop. Nested `parallel`
   // children are owned and scheduled by their parent node, so they must not
   // be treated as independent run-level nodes here.
@@ -176,8 +194,8 @@ async function executeWorkflowRun(
   let lastProgressSignature = "";
 
   while (true) {
-    if (activeSignal(deps, options)?.aborted) return saveRunStatus(run, store, deps, "paused", "Workflow paused by signal");
-    if (runDeadline.expired()) return expireRun(run, store, deps, runDeadline);
+    if (controller.aborted) return shutdownRun(run, store, deps, controller, options);
+    if (runDeadline.expired()) return expireRun(run, store, deps, runDeadline, controller);
 
     // A full pass that changes no node state means the scheduler cannot make
     // further progress. Bail out instead of spinning forever.
@@ -197,7 +215,12 @@ async function executeWorkflowRun(
     currentCheckpoints = checkpoints;
     const ready = allNodes.filter((node) => isReady(node, checkpoints, completedThisRun, failedThisRun, skippedThisRun, lastAttemptByNode, nodeById, Boolean(deps.confirm) || Boolean(options.dryRun) || Boolean(options.approveRetry), Boolean(options.dryRun)));
 
+
     if (ready.length === 0) {
+      // A stop can land after the last node finished; the run must still report
+      // itself stopped rather than passed.
+      if (controller.aborted) return shutdownRun(run, store, deps, controller, options);
+
       const latest = await store.loadNodes(run.id);
       const terminal = summarizeTerminalState(allNodes, latest);
       run.completedNodeIds = terminal.completed;
@@ -216,8 +239,8 @@ async function executeWorkflowRun(
     run.updatedAt = isoNow(deps);
     await store.saveRun(run);
 
-    await Promise.all(batch.map(async (node) => {
-      const result = await executeNode(run, node, deps, store, options, runDeadline).catch(async (error: unknown) => {
+    await raceWithShutdown(Promise.all(batch.map(async (node) => {
+      const result = await executeNode(run, node, deps, store, options, runDeadline, controller).catch(async (error: unknown) => {
         const attempt = await store.nextNodeAttempt(run.id, node.id);
         const failed = makeNodeRun(node, "failed", deps, { attempt, error: error instanceof Error ? error.message : String(error) });
         await store.saveNode(run.id, failed);
@@ -231,7 +254,7 @@ async function executeWorkflowRun(
       if (result.status === "failed" || result.status === "timed_out" || result.status === "cancelled") failedThisRun.add(node.id);
       if (result.status === "waiting_approval") waitingThisRun.add(node.id);
       if (result.status === "skipped") skippedThisRun.add(node.id);
-    }));
+    })), controller);
 
     const backoff = computeBackoffDelayMs(allNodes, lastAttemptByNode);
     if (backoff > 0) {
@@ -250,7 +273,12 @@ async function executeWorkflowRun(
 
     // A node that ran out of run budget did not fail on its own merits; let
     // the deadline check below report the run as `timed_out` instead.
-    if (runDeadline.expired()) return expireRun(run, store, deps, runDeadline);
+    if (runDeadline.expired()) return expireRun(run, store, deps, runDeadline, controller);
+
+    // Nodes stopped by shutdown land as `cancelled`, which would otherwise trip
+    // stopOnFailure and report the run as `failed`. A stopped run is not a failed
+    // run, so shutdown claims it first.
+    if (controller.aborted) return shutdownRun(run, store, deps, controller, options);
 
     if ((run.policies.stopOnFailure ?? true) && [...failedThisRun].some((id) => isTerminalFailure(allNodes, id))) {
       const terminal = summarizeTerminalState(allNodes, await store.loadNodes(run.id));
@@ -280,7 +308,12 @@ function isReady(
   if (existing?.status === "skipped" && existing.nodeHash === hash) return false;
   if (existing?.status === "waiting_approval") return canResumeApproval && (node.type === "approval" || existing.output === "retry_approval_required");
   if (existing?.status === "pending") return true;
-  if (existing?.status === "failed" || existing?.status === "timed_out" || existing?.status === "cancelled") {
+  if (existing?.status === "cancelled") {
+    if (existing.nodeHash !== hash) return false;
+    // Interrupted by shutdown, not a failed attempt: always eligible to re-run.
+    return true;
+  }
+  if (existing?.status === "failed" || existing?.status === "timed_out") {
     if (existing.nodeHash !== hash) return false;
     // A node that failed but still has retry budget goes back into the ready
     // set so the run loop can attempt it again.
@@ -313,6 +346,7 @@ async function executeNode(
   store: WorkflowStore,
   options: WorkflowRunOptions,
   deadline?: RunDeadline,
+  controller?: RunController,
 ): Promise<WorkflowNodeRun> {
   const attempt = await store.nextNodeAttempt(run.id, node.id);
   const existing = await store.loadNode(run.id, node.id);
@@ -372,18 +406,18 @@ async function executeNode(
   const executeCurrentNode = async (): Promise<WorkflowNodeRun> => {
     switch (node.type) {
       case "agent":
-        return executeAgentNode(run, node, deps, store, options, attempt);
+        return executeAgentNode(run, node, deps, store, options, attempt, controller?.signal);
       case "tool":
-        return executeToolNode(run, node, deps, store, options, attempt);
+        return executeToolNode(run, node, deps, store, options, attempt, controller?.signal);
       case "test":
         return executeTestNode(run, node, deps, store, options, attempt);
       case "approval":
         return executeApprovalNode(run, node, deps, store, options, attempt);
       case "prompt":
       case "reduce":
-        return executePromptNode(run, node, deps, store, options, attempt);
+        return executePromptNode(run, node, deps, store, options, attempt, controller?.signal);
       case "skill":
-        return executeSkillNode(run, node, deps, store, options, attempt);
+        return executeSkillNode(run, node, deps, store, options, attempt, controller?.signal);
       case "parallel":
         return executeParallelNode(run, node, deps, store, options, attempt);
       case "loop":
@@ -411,6 +445,7 @@ async function executeAgentNode(
   store: WorkflowStore,
   options: WorkflowRunOptions,
   attempt: number,
+  runSignal?: AbortSignal,
 ): Promise<WorkflowNodeRun> {
   const checkpoints = await store.loadNodes(run.id);
   const task = interpolateString(node.task, { inputs: run.inputs, nodes: checkpoints });
@@ -418,7 +453,7 @@ async function executeAgentNode(
   const agent = await deps.loadAgent(node.agent);
   if (!agent) return makeNodeRun(node, "failed", deps, { attempt, input: task, error: `Unknown agent: ${node.agent}` });
 
-  const result = await deps.executeAgent(agent, task, executionOptions(run, node, deps, options));
+  const result = await deps.executeAgent(agent, task, executionOptions(run, node, deps, options, runSignal));
   const { output, usage, usageReported, tokenBudget } = normalizeAgentResult(result);
   return withValidatedOutput(node, makeNodeRun(node, "passed", deps, {
     attempt,
@@ -438,12 +473,13 @@ async function executeToolNode(
   store: WorkflowStore,
   options: WorkflowRunOptions,
   attempt: number,
+  runSignal?: AbortSignal,
 ): Promise<WorkflowNodeRun> {
   const checkpoints = await store.loadNodes(run.id);
   const input = interpolateValue(node.input ?? {}, { inputs: run.inputs, nodes: checkpoints }) as Record<string, unknown>;
   if (node.sandbox && input["sandbox"] === undefined) input["sandbox"] = node.sandbox;
   if (options.dryRun && !isDryRunSafeTool(deps, node.tool)) return drySkipped(node, deps, input, `Dry run: skipped tool ${node.tool}`, attempt);
-  const result = await deps.toolRegistry.execute(node.tool, input);
+  const result = await deps.toolRegistry.execute(node.tool, input, { signal: runSignal, idempotencyKey: node.idempotencyKey ?? `${run.id}:${node.id}` });
   const output = normalizeToolResult(result);
   const status: WorkflowNodeStatus = result.isError ? "failed" : "passed";
   return withValidatedOutput(node, makeNodeRun(node, status, deps, { attempt, input, output, summary: summarizeOutput(output), error: result.isError ? result.output : undefined, dryRun: options.dryRun === true }));
@@ -456,13 +492,14 @@ async function executeTestNode(
   store: WorkflowStore,
   options: WorkflowRunOptions,
   attempt: number,
+  runSignal?: AbortSignal,
 ): Promise<WorkflowNodeRun> {
   const checkpoints = await store.loadNodes(run.id);
   const failures: string[] = [];
   const skipped: string[] = [];
 
   for (const assertion of node.assertions) {
-    if (activeSignal(deps, options)?.aborted) return makeNodeRun(node, "cancelled", deps, { attempt, error: "Workflow paused by signal during test node" });
+    if (runSignal?.aborted) return makeNodeRun(node, "cancelled", deps, { attempt, error: "Workflow paused by signal during test node" });
     if (assertion.type === "output_contains") {
       const value = outputText(checkpoints[assertion.node]?.output);
       if (!value.includes(assertion.value)) failures.push(`${assertion.node} output does not contain ${assertion.value}`);
@@ -531,6 +568,7 @@ async function executePromptNode(
   store: WorkflowStore,
   options: WorkflowRunOptions,
   attempt: number,
+  runSignal?: AbortSignal,
 ): Promise<WorkflowNodeRun> {
   const checkpoints = await store.loadNodes(run.id);
   const prompt = interpolateString(node.prompt, { inputs: run.inputs, nodes: checkpoints });
@@ -577,12 +615,13 @@ async function executeSkillNode(
   store: WorkflowStore,
   options: WorkflowRunOptions,
   attempt: number,
+  runSignal?: AbortSignal,
 ): Promise<WorkflowNodeRun> {
   if (!deps.executeSkill) return makeNodeRun(node, "failed", deps, { attempt, error: "No skill executor configured" });
   const checkpoints = await store.loadNodes(run.id);
   const args = interpolateString(node.args ?? "", { inputs: run.inputs, nodes: checkpoints });
   if (options.dryRun) return drySkipped(node, deps, args, `Dry run: skipped skill ${node.skill}`, attempt);
-  const result = await deps.executeSkill(node.skill, args, executionOptions(run, node, deps, options));
+  const result = await deps.executeSkill(node.skill, args, executionOptions(run, node, deps, options, runSignal));
   const { output, usage } = normalizeAgentResult(result);
   return withValidatedOutput(node, makeNodeRun(node, "passed", deps, { attempt, input: args, output, usage, summary: summarizeOutput(output) }));
 }
@@ -1016,7 +1055,7 @@ function resolveInputs(definition: WorkflowDefinition, supplied: Record<string, 
   return { ...out, ...supplied };
 }
 
-function executionOptions(run: WorkflowRun, node: WorkflowNodeDefinition, deps: WorkflowRuntimeDeps, options: WorkflowRunOptions): AgentExecutionOptions {
+function executionOptions(run: WorkflowRun, node: WorkflowNodeDefinition, deps: WorkflowRuntimeDeps, options: WorkflowRunOptions, runSignal?: AbortSignal): AgentExecutionOptions {
   return {
     model: node.model,
     effort: node.effort,
@@ -1090,14 +1129,152 @@ function createRunDeadline(run: WorkflowRun, deps: WorkflowRuntimeDeps): RunDead
  * Mark a run as timed out, checkpointing any node that was still in flight as
  * `timed_out` so the partial state is inspectable and resumable.
  */
+export type ShutdownReason = "cancelled" | "paused" | "timed_out";
+
+/**
+ * A run-scoped controller that owns cancellation for the whole run.
+ *
+ * Cancellation used to be checked at scattered call sites, so a tool that
+ * ignored its signal was abandoned mid-flight. The controller centralises
+ * aborting and lets shutdown await in-flight work, so the process can exit
+ * with the run left clean and resumable.
+ */
+export interface RunController {
+  readonly signal: AbortSignal;
+  readonly aborted: boolean;
+  readonly reason: ShutdownReason | undefined;
+  abort(reason: ShutdownReason): void;
+  track<T>(work: Promise<T>): Promise<T>;
+  settle(graceMs: number): Promise<{ drained: boolean; abandoned: number }>;
+}
+
+export function createRunController(parent?: AbortSignal): RunController {
+  const inner = new AbortController();
+  const inFlight = new Set<Promise<unknown>>();
+  let reason: ShutdownReason | undefined;
+
+  if (parent) {
+    if (parent.aborted) {
+      reason = "paused";
+      inner.abort(parent.reason);
+    } else {
+      parent.addEventListener("abort", () => {
+        if (!reason) reason = "paused";
+        inner.abort(parent.reason);
+      }, { once: true });
+    }
+  }
+
+  return {
+    signal: inner.signal,
+    get aborted() { return inner.signal.aborted; },
+    get reason() { return reason; },
+    abort(next: ShutdownReason) {
+      if (inner.signal.aborted) return;
+      reason = next;
+      inner.abort(new Error("Workflow " + next));
+    },
+    track<T>(work: Promise<T>): Promise<T> {
+      inFlight.add(work);
+      const done = () => { inFlight.delete(work); };
+      work.then(done, done);
+      return work;
+    },
+    async settle(graceMs: number) {
+      if (inFlight.size === 0) return { drained: true, abandoned: 0 };
+      const pending = [...inFlight];
+      const timeout = new Promise<"timeout">((resolve) => {
+        const t = setTimeout(() => resolve("timeout"), graceMs);
+        t.unref?.();
+      });
+      const result = await Promise.race([Promise.allSettled(pending).then(() => "drained" as const), timeout]);
+      if (result === "drained") return { drained: true, abandoned: 0 };
+      return { drained: false, abandoned: inFlight.size };
+    },
+  };
+}
+
+/**
+ * Await a batch, but stop waiting as soon as the run is asked to stop.
+ *
+ * Without this the scheduler blocks on a tool that ignores its abort signal,
+ * so the grace period can never bound it and the process cannot exit cleanly.
+ */
+async function raceWithShutdown<T>(batch: Promise<T>, controller: RunController): Promise<T | undefined> {
+  if (controller.aborted) return undefined;
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<undefined>((resolve) => {
+    onAbort = () => resolve(undefined);
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([batch, aborted]);
+  } finally {
+    if (onAbort) controller.signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
+ * Stop a run cleanly: abort in-flight work, wait a bounded grace period, then
+ * checkpoint anything still running as `cancelled` so the run stays resumable.
+ */
+async function shutdownRun(
+  run: WorkflowRun,
+  store: WorkflowStore,
+  deps: WorkflowRuntimeDeps,
+  controller: RunController,
+  options: WorkflowRunOptions,
+): Promise<WorkflowRun> {
+  const graceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
+  const { drained, abandoned } = await controller.settle(graceMs);
+
+  const reason = controller.reason ?? "paused";
+  const message = reason === "timed_out"
+    ? `Workflow exceeded maxRuntimeSeconds (${run.policies.maxRuntimeSeconds})`
+    : "Workflow stopped by signal";
+
+  const checkpoints = await store.loadNodes(run.id);
+  for (const node of run.definition.nodes) {
+    const checkpoint = checkpoints[node.id];
+    if (checkpoint?.status === "running") {
+      await store.saveNode(run.id, {
+        ...checkpoint,
+        status: "cancelled",
+        endedAt: isoNow(deps),
+        error: message,
+      });
+    }
+  }
+
+  const latest = await store.loadNodes(run.id);
+  const terminal = summarizeTerminalState(run.definition.nodes, latest);
+  run.completedNodeIds = terminal.completed;
+  run.failedNodeIds = terminal.failed;
+  run.waitingApprovalNodeIds = terminal.waiting;
+  run.currentNodeIds = [];
+
+  const saved = await saveRunStatus(run, store, deps, reason === "cancelled" ? "cancelled" : "paused", message);
+
+  if (!drained && abandoned > 0) {
+    deps.onShutdownWarning?.(
+      abandoned + " workflow task(s) did not stop within " + graceMs + "ms and may still be running",
+    );
+  }
+  return saved;
+}
 async function expireRun(
   run: WorkflowRun,
   store: WorkflowStore,
   deps: WorkflowRuntimeDeps,
   deadline: RunDeadline,
+  controller: RunController,
 ): Promise<WorkflowRun> {
   const limit = run.policies.maxRuntimeSeconds;
   const message = `Workflow exceeded maxRuntimeSeconds (${limit})`;
+
+  // Signal in-flight tools before checkpointing so they stop promptly instead of
+  // being abandoned mid-flight.
+  controller.abort("timed_out");
 
   const checkpoints = await store.loadNodes(run.id);
   for (const node of run.definition.nodes) {
@@ -1121,10 +1298,13 @@ async function expireRun(
 
   return saveRunStatus(run, store, deps, "timed_out", message);
 }
+
 function summarizeTerminalState(nodes: WorkflowNodeDefinition[], checkpoints: Record<string, WorkflowNodeRun>) {
   return {
     completed: nodes.filter((node) => checkpoints[node.id]?.status === "passed").map((node) => node.id),
     failed: nodes.filter((node) => checkpoints[node.id]?.status === "failed" || checkpoints[node.id]?.status === "timed_out").map((node) => node.id),
+    // Interrupted by shutdown: eligible to re-run, not a failure.
+    cancelled: nodes.filter((node) => checkpoints[node.id]?.status === "cancelled").map((node) => node.id),
     waiting: nodes.filter((node) => checkpoints[node.id]?.status === "waiting_approval").map((node) => node.id),
   };
 }

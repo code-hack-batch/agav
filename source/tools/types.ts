@@ -20,6 +20,11 @@ export interface ToolResult {
 
 export interface ToolContext {
   env?: Record<string, string>;
+  /**
+   * Abort signal for the operation that invoked this tool. Lets a long-running
+   * tool stop promptly when its workflow is cancelled or times out, instead of
+   * being abandoned mid-flight.
+   */
   signal?: AbortSignal;
   /**
    * Stable key for the current logical operation, supplied by a workflow node so
