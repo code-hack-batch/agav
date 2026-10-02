@@ -383,6 +383,44 @@ Tools invoked by a workflow node receive the run signal and an idempotency key, 
 stop promptly and deduplicate side effects across retries. The agent loop still invokes tools
 without a context, so `execute` only forwards a second argument when one is supplied.
 
+## Token and cost budget enforcement
+
+`policies.tokenBudget` was declared but never checked, so a runaway agent node could
+overspend without the run noticing. It is now enforced against the usage the
+observability layer already records.
+
+### Behavior
+
+- Cumulative input + output tokens are summed from the run's node checkpoints, so the
+  figure stays correct across a resume, where earlier nodes ran in a prior process;
+- the budget is checked **between nodes**, alongside the `maxRuntimeSeconds` ceiling. A
+  model call cannot be interrupted once issued, so the earliest correct place to act is
+  where the spend has just become known and no further work has started;
+- exceeding it fails the run with `Workflow exceeded its tokenBudget (used/limit tokens)`,
+  naming the actual spend so an overshoot is visible;
+- `0`, negative, and missing values leave the run unbounded;
+- nodes that reported no usage contribute nothing.
+
+**Enforcement boundary:** nodes already admitted in the current scheduler pass still
+complete. The budget prevents *subsequent* work, not work in flight. That is a deliberate
+consequence of not being able to interrupt a model call, and it is covered by a test so the
+boundary cannot drift silently.
+
+### Observability
+
+`computeRunMetrics` reports `tokenBudget` and `tokenBudgetExceeded`, and `formatMetrics`
+prints remaining headroom:
+
+```text
+Token budget: 620 / 500
+Run exceeded its tokenBudget.
+```
+
+### Not enforced
+
+`policies.costBudgetUsd` is still a no-op: converting tokens to money needs a per-model
+price table that does not exist yet. External (A2A) agents cannot be enforced either,
+because their consumption is not observable from here.
 ## Observability
 
 Added `source/workflows/metrics.ts`, which derives a metrics rollup from a run summary.
@@ -588,8 +626,7 @@ Implemented safeguards:
 
 Remaining retry/idempotency work:
 
-- native agent tools do not yet receive idempotency metadata directly;
-- no exponential backoff policy yet;
+- native agent tools do not yet receive idempotency metadata directly (see Known gaps);
 - no per-tool mutability inference beyond tool schema and node type defaults;
 - no CLI command yet for `resume --approve-retry` in slash help text beyond supported option handling.
 
@@ -644,4 +681,4 @@ checked. Enforce them against the usage metrics the observability layer
 already computes, so a runaway agent node stops the run instead of silently
 overspending.
 
-## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced. All,  in-process model-calling node types now report usage, and runs are bounded by,  `maxRuntimeSeconds`, so both the accounting and a wall-clock ceiling are in place.,  External (A2A) agents are reported but cannot be enforced, because their consumption,  is not observable from here;,- cost estimation requires a per-model price table; only raw token counts are available;,- external agents that return neither `usage` nor `tokenBudget` are flagged rather than,  treated as zero-token calls;,- a tool that ignores its `AbortSignal` still runs to completion in the background. The,  grace period bounds how long the run waits and the run exits cleanly, but the process,  does not kill the work. Background-process execution should terminate child processes,  rather than abandoning their promises;,- metrics are computed on demand, not persisted or aggregated across runs.,
+## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced. All,  in-process model-calling node types report usage, and runs are bounded by,  `maxRuntimeSeconds`, so both the accounting and a wall-clock ceiling are in place.,  External (A2A) agents are reported but cannot be enforced, because their consumption,  is not observable from here;,- cost estimation requires a per-model price table; only raw token counts are available,,  so `costBudgetUsd` cannot be enforced without one;,- a tool that ignores its `AbortSignal` still runs to completion in the background. The,  grace period bounds how long the run waits and the run exits cleanly, but the process,  does not kill the work. Background-process execution should terminate child processes,  rather than abandoning their promises;,- native agent tools do not receive an idempotency key. Workflow `tool` nodes and A2A,  agents do, but `source/agent/loop.ts` invokes tools without a context, so a retried,  native agent tool call is not deduplicated;,- metrics are computed on demand, not persisted or aggregated across runs;,- no scheduling. `agav workflows schedule add` is not implemented;

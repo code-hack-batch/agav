@@ -29,6 +29,10 @@ export interface WorkflowRunMetrics {
   skippedNodes: number;
   runningNodes: number;
   timedOutNodes: number;
+  /** Configured `policies.tokenBudget`, when set. */
+  tokenBudget?: number;
+  /** True when tracked token usage reached or passed `tokenBudget`. */
+  tokenBudgetExceeded: boolean;
   cancelledNodes: number;
   dryRunNodes: number;
   mockedNodes: number;
@@ -102,6 +106,11 @@ export function computeRunMetrics(summary: WorkflowRunSummary, now = new Date())
     status: run.status,
     durationMs: runDurationMs(run.createdAt, run.updatedAt, now),
     maxRuntimeSeconds: run.policies.maxRuntimeSeconds,
+    tokenBudget: run.policies.tokenBudget,
+    tokenBudgetExceeded:
+      run.policies.tokenBudget !== undefined
+      && run.policies.tokenBudget > 0
+      && inputTokens + outputTokens >= run.policies.tokenBudget,
     runtimeExceeded: run.status === "timed_out",
     nodeCount: nodes.length,
     completedNodes: byStatus.get("passed") ?? 0,
@@ -200,6 +209,12 @@ export function formatMetrics(metrics: WorkflowRunMetrics): string {
         ? ` (limit ${formatDuration(metrics.maxRuntimeSeconds * 1000)})`
         : ""),
     ...(metrics.runtimeExceeded ? ["", "Run exceeded its maxRuntimeSeconds ceiling."] : []),
+    ...(metrics.tokenBudget
+      ? [`Token budget: ${metrics.totalTokens} / ${metrics.tokenBudget}`]
+      : []),
+    ...(metrics.tokenBudgetExceeded
+      ? ["Run exceeded its tokenBudget."]
+      : []),
     "",
     `Nodes: ${metrics.nodeCount} total` +
       ` | ${metrics.completedNodes} passed` +

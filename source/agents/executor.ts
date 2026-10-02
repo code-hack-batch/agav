@@ -151,11 +151,17 @@ export async function executeNativeAgentDetailed(
     for (const tool of agent.tools) {
       childRegistry.register({
         schema: tool.schema,
-        // Forward the whole context so signal and any future fields reach the tool,
-        // and add the workflow idempotency key so agent tools can deduplicate
-        // repeated side effects across retries and resumes.
+        // Forward the whole context so signal and any future fields reach the tool.
+        // The idempotency key is scoped per tool so distinct calls within one node
+        // cannot collide with each other.
         execute: (input, context) =>
-          tool.execute(input, { ...context, env: runtimeConfig, idempotencyKey: deps.idempotencyKey }),
+          tool.execute(input, {
+            ...context,
+            env: runtimeConfig,
+            idempotencyKey: deps.idempotencyKey
+              ? `${deps.idempotencyKey}:${tool.schema.name}`
+              : undefined,
+          }),
       });
     }
 

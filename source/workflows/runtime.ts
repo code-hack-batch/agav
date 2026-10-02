@@ -190,12 +190,21 @@ async function executeWorkflowRun(
   let currentCheckpoints: Record<string, WorkflowNodeRun> = {};
   const lastAttemptByNode = new Map<string, number>();
 
+  const budgetLimit = run.policies.tokenBudget ?? 0;
   let schedulerPasses = 0;
   let lastProgressSignature = "";
 
   while (true) {
     if (controller.aborted) return shutdownRun(run, store, deps, controller, options);
     if (runDeadline.expired()) return expireRun(run, store, deps, runDeadline, controller);
+    // A model call cannot be interrupted once issued, so the budget is enforced
+    // between nodes: the earliest point where the spend is known and no further
+    // work has been started. The policy check is hoisted so an unbounded run does
+    // no extra checkpoint I/O on every pass.
+    if (budgetLimit > 0) {
+      const budgetStopped = await enforceTokenBudget(run, store, deps, budgetLimit);
+      if (budgetStopped) return budgetStopped;
+    }
 
     // A full pass that changes no node state means the scheduler cannot make
     // further progress. Bail out instead of spinning forever.
@@ -1237,6 +1246,62 @@ async function raceWithShutdown<T>(batch: Promise<T>, controller: RunController)
  * Stop a run cleanly: abort in-flight work, wait a bounded grace period, then
  * checkpoint anything still running as `cancelled` so the run stays resumable.
  */
+/**
+ * Tokens consumed so far by a run, summed from its node checkpoints.
+ *
+ * Budget enforcement reads the persisted checkpoints rather than an in-memory
+ * counter so it stays correct across resumes, where earlier nodes ran in a
+ * previous process.
+ */
+async function consumedTokens(run: WorkflowRun, store: WorkflowStore): Promise<number> {
+  const checkpoints = await store.loadNodes(run.id);
+  let total = 0;
+  for (const node of Object.values(checkpoints)) {
+    total += (node.usage?.inputTokens ?? 0) + (node.usage?.outputTokens ?? 0);
+  }
+  return total;
+}
+
+/**
+ * Stop a run that has exceeded `policies.tokenBudget`.
+ *
+ * The budget is checked between nodes rather than mid-call: a model call cannot
+ * be interrupted once issued, so the earliest correct place to act is the point
+ * where the spend becomes known and no further work has started.
+ */
+async function enforceTokenBudget(
+  run: WorkflowRun,
+  store: WorkflowStore,
+  deps: WorkflowRuntimeDeps,
+  limit: number,
+): Promise<WorkflowRun | undefined> {
+
+  const used = await consumedTokens(run, store);
+  if (used < limit) return undefined;
+
+  const message = `Workflow exceeded its tokenBudget (${used}/${limit} tokens)`;
+  const checkpoints = await store.loadNodes(run.id);
+  for (const node of run.definition.nodes) {
+    const checkpoint = checkpoints[node.id];
+    if (checkpoint?.status === "running") {
+      await store.saveNode(run.id, {
+        ...checkpoint,
+        status: "failed",
+        endedAt: isoNow(deps),
+        error: message,
+      });
+    }
+  }
+
+  const latest = await store.loadNodes(run.id);
+  const terminal = summarizeTerminalState(run.definition.nodes, latest);
+  run.completedNodeIds = terminal.completed;
+  run.failedNodeIds = terminal.failed;
+  run.waitingApprovalNodeIds = terminal.waiting;
+  run.currentNodeIds = [];
+
+  return saveRunStatus(run, store, deps, "failed", message);
+}
 async function shutdownRun(
   run: WorkflowRun,
   store: WorkflowStore,

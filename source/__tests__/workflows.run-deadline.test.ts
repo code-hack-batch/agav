@@ -66,19 +66,30 @@ describe("run-level maxRuntimeSeconds", () => {
   });
 
   afterEach(async () => {
-    await rm(dir, { recursive: true, force: true });
+    // A run stopped by the ceiling may still have an iteration finishing in the
+    // background, which can recreate a checkpoint file as the directory is
+    // removed. Retry briefly so cleanup does not race that late write.
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        await rm(dir, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || attempt === 9) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
   });
 
   it("stops a run that exceeds maxRuntimeSeconds", async () => {
     registry.register(tool("slow", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await new Promise((resolve) => setTimeout(resolve, 1500));
       return { output: "done", isError: false };
     }));
 
     const run = await runWorkflow(workflow([
       { id: "slow", type: "tool", tool: "slow" },
       { id: "after", type: "tool", tool: "slow", dependsOn: ["slow"] },
-    ], { maxRuntimeSeconds: 0.05 }), {}, { provider, config, toolRegistry: registry, loadAgent, executeAgent, store });
+    ], { maxRuntimeSeconds: 1 }), {}, { provider, config, toolRegistry: registry, loadAgent, executeAgent, store });
 
     expect(run.status).toBe("timed_out");
     expect(run.error).toContain("maxRuntimeSeconds");
@@ -169,8 +180,14 @@ describe("run-level maxRuntimeSeconds", () => {
       schema: { name: "tick", description: "tick", inputSchema: { type: "object" } },
       execute: async (_input, context) => {
         iterations++;
-        if (context?.signal?.aborted) return { output: "tick", isError: false };
-        await new Promise((resolve) => setTimeout(resolve, 15));
+        const signal = context?.signal;
+        if (signal?.aborted) return { output: "tick", isError: false };
+        // Wake on abort as well as on the timer, so the tool stops promptly
+        // instead of finishing in the background after the run has returned.
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 15);
+          signal?.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+        });
         return { output: "tick", isError: false };
       },
     });
@@ -187,14 +204,17 @@ describe("run-level maxRuntimeSeconds", () => {
   it("keeps completed node results so the run is resumable", async () => {
     registry.register(tool("quick", async () => ({ output: "done", isError: false })));
     registry.register(tool("slow", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Long enough that the ceiling always cuts it short, even under load,
+      // while the ceiling itself stays generous enough for the quick node to
+      // finish. Asserting on a 50ms window made this a timing test.
+      await new Promise((resolve) => setTimeout(resolve, 5000));
       return { output: "done", isError: false };
     }));
 
     const run = await runWorkflow(workflow([
       { id: "first", type: "tool", tool: "quick" },
       { id: "slow", type: "tool", tool: "slow", dependsOn: ["first"] },
-    ], { maxRuntimeSeconds: 0.05 }), {}, { provider, config, toolRegistry: registry, loadAgent, executeAgent, store });
+    ], { maxRuntimeSeconds: 0.5 }), {}, { provider, config, toolRegistry: registry, loadAgent, executeAgent, store });
 
     expect(run.status).toBe("timed_out");
     const first = await store.loadNode(run.id, "first");
