@@ -514,6 +514,79 @@ so the failure lands on the node that actually needs a model and carries that no
 
 Covered by a CLI smoke test that runs a credential-free workflow with every provider key
 blanked.
+## Detached workflow jobs
+
+A scheduled run must outlive whatever started it: the terminal that launched it, and
+eventually the daemon that triggered it. `source/workflows/jobs.ts` gives a run that lifetime.
+
+```ts
+startWorkflowJob({ target, runId, input?, cwd? }): Promise<WorkflowJobRecord>
+stopWorkflowJob(jobId): Promise<WorkflowJobRecord | null>
+listWorkflowJobs(): Promise<WorkflowJobRecord[]>
+listOrphanedWorkflowJobs(): Promise<WorkflowJobRecord[]>
+isWorkflowJobAlive(record): boolean
+markWorkflowJobFinished(jobId, outcome?): Promise<WorkflowJobRecord | null>
+pruneWorkflowJobs(maxAgeMs?, now?): Promise<number>
+requestStop(runId): Promise<boolean>
+watchForStopRequest(runId, onStop, intervalMs?): () => void
+formatWorkflowJob(record): string
+```
+
+State lives in `~/.agav/workflow-jobs/<job-id>.json`, overridable with
+`AGAV_WORKFLOW_JOB_DIR`. It is deliberately a **separate namespace** from
+`~/.agav/background-processes`: a workflow run already owns rich state in `run.json`, and
+folding shell jobs and workflow runs into one list would make `list` ambiguous about what is
+actually running. The record exists only to answer *is it alive, what started it, how do I
+stop it*.
+
+```bash
+agav workflows jobs                # list, with running / orphaned / exit-code state
+agav workflows jobs-stop <job-id>  # request a clean stop
+agav workflows notifications      # report runs finished while no session was watching
+```
+
+### Detachment
+
+`detached: true` plus `unref()`, so closing the terminal does not abort work already in flight.
+The child's pid is recorded immediately, which keeps the run stoppable and lets a listing
+distinguish a live child from one that died with its parent.
+
+### Stopping, and why it is not a signal
+
+**Windows cannot deliver `SIGTERM` to another process.** `child.kill('SIGTERM')` maps to
+`TerminateProcess`, so no Node handler ever runs and the run dies mid-node with its checkpoint
+still `running`. A stop request therefore travels through a file the child polls:
+
+```text
+jobs-stop <job-id>  ->  writes <run-id>.stop  ->  child polls  ->  aborts cleanly
+```
+
+An IPC pipe was tried first and is wrong here: it dies with the spawning process, and the
+entire point is that the parent exits. The file is the only channel that outlives it.
+
+`SIGTERM`/`SIGINT` handlers remain for POSIX and local Ctrl+C.
+
+### Stop attribution
+
+A node torn down by a stop reports an error, because the work was interrupted rather than
+completed. Recording that as `failed` would misrepresent a deliberate stop as a genuine failure
+and make the run look broken rather than resumable, so it is attributed to the stop and
+recorded as `cancelled`. The run ends `paused` and resumes cleanly.
+
+### Credentials
+
+The child environment strips `*KEY|*SECRET|*TOKEN|*PASSWORD|*CREDENTIAL|*AUTH`, matching the
+background-process runner. That is safe here because provider credentials are encrypted at rest
+and decrypted by `loadConfig()` in the child; the CLI does not read them from the environment.
+
+### New CLI flags
+
+```text
+agav workflows run <workflow> --input-json '<json>' --run-id <id>
+```
+
+`--run-id` lets a detached caller pre-assign the run id, so its job record and the run directory
+agree. `--input-json` avoids a temp file the spawning side would have to keep in sync.
 ## Observability
 
 `computeRunMetrics` reports `tokenBudget` and `tokenBudgetExceeded`, and `formatMetrics`
@@ -743,6 +816,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.jobs.test.ts` | Job record round-trip, listing order, live/dead pid detection, orphan detection, finish marking, stop-request write/detect/clear, watcher single-fire and disposal, pruning policy, CLI formatting. |
 | `source/__tests__/workflows.notifications.test.ts` | `onComplete` firing once per terminal status, exclusion of `waiting_approval`, broken-hook and broken-sink isolation, once-only delivery, `notifiedAt` stamping, notification log, subscriber lifecycle. |
 | `source/__tests__/workflows.condition.test.ts` | Condition evaluation: truthiness, equality, ordering, input references, NaN rejection, and validator rejection of malformed conditions. |
 | `source/__tests__/workflows.when.test.ts` | Conditional branching end to end: run/skip, skip recording, no deadlock on a skipped dependency, dependent re-evaluation, input conditions, durability across resume. |

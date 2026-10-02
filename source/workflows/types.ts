@@ -291,6 +291,13 @@ export interface WorkflowRunOptions {
   shutdownGraceMs?: number;
   dryRun?: boolean;
   force?: boolean;
+  /**
+   * Use this run id instead of minting one.
+   *
+   * A detached caller must record the run id before the run exists, so its job
+   * record can be tied to the run directory and the run stays stoppable.
+   */
+  runId?: string;
   mocks?: WorkflowMocks;
   allowModelCalls?: boolean;
   allowCommands?: boolean;

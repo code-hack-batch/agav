@@ -71,7 +71,12 @@ export interface AgavConfig {
   showThinking?: boolean;
 }
 
-const AGAV_DIR = join(homedir(), ".agav");
+// Overridable so a test, an alternate install, or a detached child can target a
+// specific directory. Both ends of a stop request must resolve to the same path,
+// so this is read once at startup and shared by everything below.
+const AGAV_DIR = process.env["AGAV_CONFIG_DIR"]
+  ? join(process.env["AGAV_CONFIG_DIR"]!.replace(/^~(?=$|[\\/])/, homedir()))
+  : join(homedir(), ".agav");
 const CONFIG_PATH = join(AGAV_DIR, "config.json");
 
 /**

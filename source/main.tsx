@@ -201,6 +201,13 @@ export function parseArgs(argv: string[]) {
       if (argv[i + 1] && !argv[i + 1]!.startsWith("-")) {
         flags.workflowsCommand = argv[++i]!;
       }
+      // Everything after the subcommand belongs to it: the dispatcher slices argv
+      // itself. Skip the rest of the parse so flags like --run-id or
+      // --input-json are not rejected here as unknown.
+      if (flags.workflowsCommand) {
+        i = argv.length;
+        break;
+      }
     } else if (arg === "run" && i === 0) {
       flags.run = true;
     } else if (flags.run && !arg.startsWith("-") && !flags.runPrompt) {
@@ -520,9 +527,44 @@ export async function main() {
     const argsStartIndex = workflowsIdx >= 0
       ? workflowsIdx + (workflowsCommand ? 2 : 1)
       : (workflowsCommand ? 4 : 3);
-    const exitCode = await runWorkflowsCommand(workflowsCommand, process.argv.slice(argsStartIndex));
-    process.exit(exitCode);
-    return;
+
+    // A detached run is stopped with SIGTERM so it can checkpoint instead of
+    // dying mid-node. Convert that into an abort the runtime understands, and
+    // give it a moment to settle before exiting.
+    const stopController = new AbortController();
+    let stopping = false;
+    const requestStop = (signal: NodeJS.Signals | "stop request") => {
+      if (stopping) return;
+      stopping = true;
+      console.error(`\nReceived ${signal}; stopping the run and checkpointing...`);
+      stopController.abort(new Error("Workflow stopped by signal"));
+    };
+    process.on("SIGTERM", requestStop);
+    process.on("SIGINT", requestStop);
+
+
+
+    // A detached run is stopped by a file request, because SIGTERM cannot be
+    // delivered on Windows. The child polls for it, so the request reaches a
+    // process whose parent has long since exited.
+    const { clearStopRequest, watchForStopRequest } = await import("./workflows/jobs.js");
+    const runIdFlag = process.argv.indexOf("--run-id");
+    const watchedRunId = runIdFlag >= 0 ? process.argv[runIdFlag + 1] : undefined;
+    const stopWatching = watchedRunId
+      ? watchForStopRequest(watchedRunId, () => requestStop("stop request"))
+      : () => {};
+
+    try {
+      const exitCode = await runWorkflowsCommand(workflowsCommand, process.argv.slice(argsStartIndex), {
+        signal: stopController.signal,
+      });
+      stopWatching();
+      if (watchedRunId) clearStopRequest(watchedRunId);
+      process.exit(exitCode);
+      return;
+    } finally {
+      stopWatching();
+    }
   }
 
   // Auto-update check (silent on failure, skipped in CI/pipe mode)

@@ -11,6 +11,8 @@ import { listWorkflows, loadWorkflow } from "../workflows/loader.js";
 import { runWorkflow, resumeWorkflow } from "../workflows/runtime.js";
 import { loadWorkflowEvals, runWorkflowEvals } from "../workflows/evals.js";
 import { WorkflowStore } from "../workflows/store.js";
+import { formatWorkflowJob, listWorkflowJobs, stopWorkflowJob } from "../workflows/jobs.js";
+import { readNotifications, refreshWorkflowRunNotifications } from "../workflows/notifications.js";
 import { cancelWorkflow, decideWorkflowApproval, getWorkflowRunMetrics, getWorkflowRunSummary, pauseWorkflow, retryWorkflowNode } from "../workflows/control.js";
 import { computeRunMetrics, formatDuration, formatMetrics, formatNodeBudget, nodeDurationMs } from "../workflows/metrics.js";
 import type { AgentDefinition } from "../agents/types.js";
@@ -24,12 +26,16 @@ function printUsage(): void {
   list                              List workflow definitions
   runs                              List workflow runs
   validate <workflow>               Validate a workflow file/name
-  run <workflow> [--input file]      Run a workflow
+  run <workflow> [--input file]      Run a workflow
+                                    [--input-json <json>] [--run-id <id>]
   dry-run <workflow> [--input file]  Run without external side effects
   test <workflow> [--eval name]      Run workflow eval fixtures
   resume <run-id>                   Resume a workflow run
   status <run-id>                   Show run status with metrics
-  metrics <run-id>                  Show detailed run metrics
+  metrics <run-id>                  Show detailed run metrics
+  jobs                              List detached workflow jobs
+  jobs-stop <job-id>                Stop a detached workflow job
+  notifications                     Show recent completion notifications
   logs <run-id> [node-id]           Show recent node logs
   checkpoints <run-id>              Show node checkpoints and pending nodes
   attempts <run-id> <node-id>       Show attempt history for a node
@@ -55,11 +61,35 @@ function parseEvalName(args: string[]): string | undefined {
   return eq?.slice("--eval=".length);
 }
 
-async function readInputs(args: string[]): Promise<Record<string, unknown>> {
-  const path = parseInputPath(args);
-  if (!path) return {};
-  return JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
-}
+async function readInputs(args: string[]): Promise<Record<string, unknown>> {
+  const inline = parseInputJson(args);
+  if (inline !== undefined) return inline;
+  const path = parseInputPath(args);
+  if (!path) return {};
+  return JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+}
+
+/** Parse `--input-json '<json>'`. Returns undefined when the flag is absent. */
+function parseInputJson(args: string[]): Record<string, unknown> | undefined {
+  const flag = args.indexOf("--input-json");
+  if (flag === -1) return undefined;
+  const raw = args[flag + 1];
+  if (raw === undefined) throw new Error("--input-json requires a JSON object");
+  const parsed = JSON.parse(raw) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("--input-json must be a JSON object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/** Parse `--run-id <id>`. Lets a detached caller pre-assign the run id. */
+function parseRunId(args: string[]): string | undefined {
+  const flag = args.indexOf("--run-id");
+  if (flag === -1) return undefined;
+  const value = args[flag + 1];
+  if (!value) throw new Error("--run-id requires a value");
+  return value;
+}
 
 async function makeRuntimeDeps() {
   const config = await loadConfig();
@@ -162,7 +192,7 @@ async function validateLoaded(definition: WorkflowDefinition): Promise<number> {
   return 1;
 }
 
-export async function runWorkflowsCommand(command: string | undefined, args: string[]): Promise<number> {
+export async function runWorkflowsCommand(command: string | undefined, args: string[], runtimeOptions: { signal?: AbortSignal } = {}): Promise<number> {
   const store = new WorkflowStore();
   try {
     if (!command || command === "help") {
@@ -206,7 +236,12 @@ export async function runWorkflowsCommand(command: string | undefined, args: str
       const valid = await validateLoaded(loaded.definition);
       if (valid !== 0) return valid;
       const deps = await makeRuntimeDeps();
-      const run = await runWorkflow(loaded.definition, await readInputs(args.slice(1)), { ...deps, store }, { dryRun: command === "dry-run" });
+      const runOptions = {
+        dryRun: command === "dry-run",
+        runId: parseRunId(args.slice(1)),
+        ...(runtimeOptions.signal ? { signal: runtimeOptions.signal } : {}),
+      };
+      const run = await runWorkflow(loaded.definition, await readInputs(args.slice(1)), { ...deps, store }, runOptions);
       console.log(formatRun(run));
       return run.status === "passed" || run.status === "waiting_approval" ? 0 : 1;
     }
@@ -257,6 +292,42 @@ export async function runWorkflowsCommand(command: string | undefined, args: str
       console.log(formatMetrics(await getWorkflowRunMetrics(id, store)));
       return 0;
     }
+
+    if (command === "jobs") {
+      const jobs = await listWorkflowJobs();
+      if (jobs.length === 0) {
+        console.log("No detached workflow jobs.");
+        return 0;
+      }
+      for (const job of jobs) console.log(formatWorkflowJob(job));
+      return 0;
+    }
+
+    if (command === "jobs-stop") {
+      const jobId = args[0];
+      if (!jobId) { printUsage(); return 1; }
+      const stopped = await stopWorkflowJob(jobId);
+      if (!stopped) {
+        console.error(`No workflow job matching ${jobId}.`);
+        return 1;
+      }
+      console.log(`Stopped workflow job ${jobId} (run ${stopped.runId}).`);
+      console.log(`Inspect it with: agav workflows status ${stopped.runId}`);
+      return 0;
+    }
+
+    if (command === "notifications") {
+      // Report anything finished but never announced, then show the log. This is
+      // how a session picks up runs that completed while it was not running.
+      await refreshWorkflowRunNotifications(store);
+      const lines = await readNotifications();
+      if (lines.length === 0) {
+        console.log("No workflow completion notifications.");
+        return 0;
+      }
+      for (const line of lines) console.log(line);
+      return 0;
+    }
 
     if (command === "logs") {
       const [id, nodeId] = args;

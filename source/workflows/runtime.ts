@@ -121,7 +121,9 @@ export async function runWorkflow(
   const resolvedInputs = resolveInputs(definition, inputs);
   const now = isoNow(deps);
   const run: WorkflowRun = {
-    id: store.createRunId(),
+    // Supplied by a caller that must track the run before it starts, such as a
+    // detached job recording its own pid against this id.
+    id: options.runId ?? store.createRunId(),
     workflowName: definition.name,
     workflowVersion: definition.version,
     workflowHash: hashValue(definition),
@@ -484,6 +486,20 @@ async function executeNode(
       status: "timed_out",
       error: `Workflow exceeded maxRuntimeSeconds (${run.policies.maxRuntimeSeconds})`,
       timedOutBy: "run",
+    };
+  }
+
+  // A node torn down by a stop usually reports an error, because the work was
+  // interrupted rather than completed. Recording that as `failed` would
+  // misrepresent a deliberate stop as a genuine failure, so attribute it to the
+  // stop: the node is `cancelled` and the run stays resumable.
+  if (controller?.aborted && (completed.status === "failed" || completed.status === "timed_out")) {
+    completed = {
+      ...completed,
+      status: "cancelled",
+      error: controller.reason === "timed_out"
+        ? completed.error
+        : "Workflow stopped by signal",
     };
   }
 
