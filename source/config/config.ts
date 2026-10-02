@@ -69,6 +69,13 @@ export interface AgavConfig {
   agentMarketplace?: string; // URL to agent marketplace repository
   hideAbsolutePath?: boolean;
   showThinking?: boolean;
+  /**
+   * Show a desktop notification when a workflow finishes with nobody watching.
+   *
+   * Off by default on a shared or remote session, where a banner is noise. The
+   * durable notification log is written regardless of this setting.
+   */
+  desktopNotifications?: boolean;
 }
 
 // Overridable so a test, an alternate install, or a detached child can target a

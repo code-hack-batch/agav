@@ -12,7 +12,13 @@ import { runWorkflow, resumeWorkflow } from "../workflows/runtime.js";
 import { loadWorkflowEvals, runWorkflowEvals } from "../workflows/evals.js";
 import { WorkflowStore } from "../workflows/store.js";
 import { formatWorkflowJob, listWorkflowJobs, stopWorkflowJob } from "../workflows/jobs.js";
-import { readNotifications, refreshWorkflowRunNotifications } from "../workflows/notifications.js";
+import {
+  desktopNotificationSink,
+  readNotifications,
+  refreshWorkflowRunNotifications,
+  terminalBellSink,
+  type WorkflowNotificationSink,
+} from "../workflows/notifications.js";
 import { cancelWorkflow, decideWorkflowApproval, getWorkflowRunMetrics, getWorkflowRunSummary, pauseWorkflow, retryWorkflowNode } from "../workflows/control.js";
 import { computeRunMetrics, formatDuration, formatMetrics, formatNodeBudget, nodeDurationMs } from "../workflows/metrics.js";
 import type { AgentDefinition } from "../agents/types.js";
@@ -319,7 +325,10 @@ export async function runWorkflowsCommand(command: string | undefined, args: str
     if (command === "notifications") {
       // Report anything finished but never announced, then show the log. This is
       // how a session picks up runs that completed while it was not running.
-      await refreshWorkflowRunNotifications(store);
+      const { desktopNotifications } = await loadConfig();
+      const extraSinks: WorkflowNotificationSink[] = [terminalBellSink];
+      if (desktopNotifications) extraSinks.push(desktopNotificationSink);
+      await refreshWorkflowRunNotifications(store, extraSinks);
       const lines = await readNotifications();
       if (lines.length === 0) {
         console.log("No workflow completion notifications.");

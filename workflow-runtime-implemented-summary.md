@@ -514,6 +514,41 @@ so the failure lands on the node that actually needs a model and carries that no
 
 Covered by a CLI smoke test that runs a credential-free workflow with every provider key
 blanked.
+### Desktop and terminal notification
+
+`agav workflows notifications` reports runs that finished while nothing was watching, and
+picks up anything a session missed. It signals through two sinks:
+
+| Sink | When | Behaviour |
+| --- | --- | --- |
+| Terminal bell | Always | `BEL` on a TTY. The one signal that needs no daemon and no desktop session. |
+| Desktop banner | `desktopNotifications: true` | The OS notification centre. |
+
+The durable `notifications.log` is written regardless, so a failed banner never loses the
+result.
+
+Desktop notifications are **dependency-free**. The project ships as a single `bun --compile`
+binary and has no native-binding dependencies, so a notifier package would break that. Each
+platform's own mechanism is invoked instead:
+
+| Platform | Primary | Fallback |
+| --- | --- | --- |
+| macOS | `osascript` (`display notification`) | — |
+| Windows | WinRT toast via PowerShell | `NotifyIcon` balloon tip |
+| Linux | `notify-send` | `zenity --notification` |
+
+Every path is best-effort and never throws: a machine with no notification daemon resolves to
+`delivered: false` rather than failing the command. Notification bodies are escaped for the
+target shell, so a workflow name or error containing `;`, `$(…)`, or quotes is data, never a
+command line.
+
+```json
+{
+  "desktopNotifications": true
+}
+```
+
+Off by default, because a banner is noise on a shared or remote screen.
 ## Detached workflow jobs
 
 A scheduled run must outlive whatever started it: the terminal that launched it, and
@@ -816,6 +851,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/utils.desktop-notify.test.ts` | Notification formatting (title, urgency, error inclusion) and real platform delivery: definite result rather than throwing, empty notification, shell metacharacters, embedded quotes and newlines. |
 | `source/__tests__/workflows.jobs.test.ts` | Job record round-trip, listing order, live/dead pid detection, orphan detection, finish marking, stop-request write/detect/clear, watcher single-fire and disposal, pruning policy, CLI formatting. |
 | `source/__tests__/workflows.notifications.test.ts` | `onComplete` firing once per terminal status, exclusion of `waiting_approval`, broken-hook and broken-sink isolation, once-only delivery, `notifiedAt` stamping, notification log, subscriber lifecycle. |
 | `source/__tests__/workflows.condition.test.ts` | Condition evaluation: truthiness, equality, ordering, input references, NaN rejection, and validator rejection of malformed conditions. |

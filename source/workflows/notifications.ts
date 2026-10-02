@@ -24,7 +24,13 @@ export type WorkflowRunEvent = {
   error?: string;
 };
 
-export type WorkflowNotificationSink = (event: WorkflowRunEvent) => void | Promise<void>;
+/**
+ * A delivery target for a finished run.
+ *
+ * May return whether it delivered, so a caller can decide on a fallback.
+ * Returning a value is optional; callers that do not care simply ignore it.
+ */
+export type WorkflowNotificationSink = (event: WorkflowRunEvent) => void | boolean | Promise<void | boolean>;
 
 const listeners = new Set<WorkflowNotificationSink>();
 let pollTimer: NodeJS.Timeout | null = null;
@@ -57,6 +63,29 @@ export function formatRunCompletion(run: CompletionLike, runId?: string): string
   return run.error ? `${head}\n  ${run.error}` : head;
 }
 
+/**
+ * Ring the terminal bell.
+ *
+ * The one notification that needs no daemon and no desktop session, so it is the
+ * right fallback on a box where `notify-send` is unavailable.
+ */
+export function terminalBellSink(): void {
+  if (!process.stdout.isTTY) return;
+  // BEL is understood by every terminal that has one; harmless otherwise.
+  process.stdout.write("\u0007");
+}
+/**
+ * Report a finished run through the desktop notification centre.
+ *
+ * Returns whether it was delivered, so a caller can tell the difference between
+ * "shown" and "this box has no notification daemon". The durable log is
+ * written regardless, so a failed desktop notification never loses the result.
+ */
+export async function desktopNotificationSink(event: WorkflowRunEvent): Promise<boolean> {
+  const { formatDesktopNotification, notifyDesktop } = await import("../utils/desktop-notify.js");
+  const result = await notifyDesktop(formatDesktopNotification(event));
+  return result.delivered;
+}
 /**
  * Append to the always-on log.
  *
