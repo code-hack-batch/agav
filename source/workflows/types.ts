@@ -210,6 +210,14 @@ export interface WorkflowRun {
   failedNodeIds: string[];
   waitingApprovalNodeIds: string[];
   error?: string;
+  /**
+   * When this run's completion was announced to an operator.
+   *
+   * Undefined until reported. Mirrors the background-process record so a run
+   * started detached can surface its result once, even if the session that
+   * started it is long gone.
+   */
+  notifiedAt?: string;
 }
 
 /**

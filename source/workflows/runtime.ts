@@ -95,6 +95,14 @@ export interface WorkflowRuntimeDeps {
    * that something may still be running in the background.
    */
   onShutdownWarning?: (message: string) => void;
+  /**
+   * Called once when a run reaches a terminal state.
+   *
+   * A scheduled run executes detached from any terminal, so the result has
+   * nowhere to appear unless something reports it. This is that hook;
+   * `notifiedAt` on the persisted run is what makes delivery once-only.
+   */
+  onComplete?: (run: WorkflowRun) => void;
   executeSkill?: (skill: string, args: string, options: AgentExecutionOptions) => Promise<string | WorkflowAgentResult>;
   confirm?: (request: WorkflowApprovalRequest) => Promise<WorkflowApprovalDecision>;
   confirmTool?: (toolName: string, input: Record<string, unknown>) => Promise<ConfirmResult>;
@@ -1422,7 +1430,27 @@ async function saveRunStatus(
   run.updatedAt = isoNow(deps);
   if (error) run.error = error;
   await store.saveRun(run);
+
+  // Every terminal state funnels through here, so this is the one place that
+  // can announce completion. `waiting_approval` is deliberately excluded: the
+  // run is not finished, and a paused run that still needs a human should
+  // surface through the approval path instead.
+  if (isTerminalRunStatus(status)) {
+    try {
+      deps.onComplete?.(run);
+    } catch {
+      // A failing notifier must not turn a successful run into a failed one.
+    }
+  }
+
   return run;
+}
+
+const TERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>(["passed", "failed", "cancelled", "timed_out"]);
+
+/** Whether a run status means no further work will happen in this run. */
+function isTerminalRunStatus(status: WorkflowRunStatus): boolean {
+  return TERMINAL_RUN_STATUSES.has(status);
 }
 
 async function trace(store: WorkflowStore, runId: string, nodeId: string, event: Record<string, unknown>): Promise<void> {
