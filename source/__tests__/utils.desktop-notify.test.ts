@@ -1,5 +1,37 @@
-import { describe, expect, it } from "vitest";
-import { formatDesktopNotification, notifyDesktop } from "../utils/desktop-notify.js";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  formatDesktopNotification,
+  notifyDesktop,
+  setNotifyLauncher,
+  type CommandResult,
+} from "../utils/desktop-notify.js";
+
+/**
+ * Delivery is exercised through an injected launcher rather than a real one.
+ * Spawning a helper process per assertion is slow enough to starve parallel
+ * suites, and it pops actual banners on the machine every run.
+ *
+ * Set `AGAV_TEST_REAL_NOTIFY=1` to include the case that really notifies.
+ */
+const runReal = process.env["AGAV_TEST_REAL_NOTIFY"] === "1";
+const SENTINEL = "AGAV_NOTIFY_OK";
+
+let restore: (() => void) | undefined;
+
+/** Record the joined arguments of every launcher call, so a stub can distinguish mechanisms. */
+function stubLauncher(result: (command: string, args: string[]) => CommandResult): string[][] {
+  const calls: string[][] = [];
+  restore = setNotifyLauncher(async (command, args) => {
+    calls.push(args);
+    return result(command, args);
+  });
+  return calls;
+}
+
+afterEach(() => {
+  restore?.();
+  restore = undefined;
+});
 
 describe("desktop notifications", () => {
   describe("formatting", () => {
@@ -29,39 +61,97 @@ describe("desktop notifications", () => {
       expect(formatDesktopNotification({ workflowName: "w", status: "timed_out" }).urgent).toBe(true);
     });
 
-    it("treats a cancellation as urgent only when there is no outcome to report", () => {
-      // A cancellation is still something the operator asked about, so it is
-      // surfaced; it is simply titled by status rather than as a failure.
+    it("titles a cancellation by status rather than as a failure", () => {
       const note = formatDesktopNotification({ workflowName: "w", status: "cancelled" });
       expect(note.urgent).toBe(true);
       expect(note.title).toBe("Workflow cancelled");
     });
   });
 
-  describe("delivery", () => {
-    // These exercise the real platform path, so they assert only that delivery
-    // resolves to a definite answer. Whether this particular machine has a
-    // notification centre is an environment fact, not a code contract.
-    it("resolves to a definite result rather than throwing", async () => {
+  describe("one notification per attempt", () => {
+    // The reported symptom was several banners for one finished workflow. This is
+    // the behaviour that prevents it: a mechanism that already showed something is
+    // never followed by a fallback, even if its exit code was non-zero.
+    it("does not fall back when the primary mechanism already showed a notification", async () => {
+      const commands = stubLauncher(() => ({ ok: false, stdout: SENTINEL, stderr: "a warning, but shown" }));
+
       const result = await notifyDesktop({ title: "t", message: "m" });
-      expect(typeof result.delivered).toBe("boolean");
-      if (result.delivered) expect(typeof result.via).toBe("string");
-      else expect(typeof result.reason).toBe("string");
+
+      // A toast was shown even though the shell reported a non-zero exit.
+      expect(result.delivered).toBe(true);
+      expect(commands).toHaveLength(1);
     });
 
-    it("survives shell metacharacters, quotes and newlines in the body", async () => {
-      // A notification body is data, never a command line. If quoting were wrong
-      // this would either error or, worse, execute something. One case covers all
-      // three hazards because they share the same escaping path.
-      const result = await notifyDesktop({
-        title: "; echo INJECTED",
-        message: "$(whoami) `id` && echo x | cat 'quoted' \"double\"\nline2",
+    it("falls back only when the primary mechanism showed nothing", async () => {
+      // WinRT is tried first and shows nothing; the balloon fallback succeeds.
+      const commands = stubLauncher((_command, args) =>
+        args.some((arg) => arg.includes("System.Windows.Forms"))
+          ? { ok: true, stdout: SENTINEL, stderr: "" }
+          : { ok: false, stdout: "", stderr: "WinRT unavailable" },
+      );
+
+      const result = await notifyDesktop({ title: "t", message: "m" });
+
+      expect(result.delivered).toBe(true);
+      // Both mechanisms were tried, because the first genuinely did not show one.
+      expect(commands.length).toBeGreaterThan(1);
+    });
+
+    it("reports undelivered when every mechanism shows nothing", async () => {
+      stubLauncher(() => ({ ok: false, stdout: "", stderr: "no daemon" }));
+
+      const result = await notifyDesktop({ title: "t", message: "m" });
+
+      expect(result.delivered).toBe(false);
+      if (result.delivered) throw new Error("expected no delivery");
+      expect(result.reason).toContain("no daemon");
+    });
+
+    it("does not throw when the launcher itself fails", async () => {
+      restore = setNotifyLauncher(async () => {
+        throw new Error("spawn failed");
       });
-      expect(typeof result.delivered).toBe("boolean");
+
+      const result = await notifyDesktop({ title: "t", message: "m" });
+      // Best-effort by contract: a broken launcher is not an error worth raising.
+      expect(result.delivered).toBe(false);
+    });
+  });
+
+  describe("escaping", () => {
+    it("passes metacharacters through the escaping path without failing", async () => {
+      // A notification body is data, never a command line. The stub cannot prove
+      // the shell quoting is correct, but it does prove the values reach the
+      // launcher intact rather than being dropped or mangled.
+      const seen: string[] = [];
+      restore = setNotifyLauncher(async (_command, args) => {
+        seen.push(args.join(" "));
+        return { ok: true, stdout: SENTINEL, stderr: "" };
+      });
+
+      const hostile = "; rm -rf / # $(whoami) `id` && echo x | cat 'quoted' \"double\"";
+      await notifyDesktop({ title: hostile, message: hostile });
+
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toContain("whoami");
     });
 
-    it("survives an empty notification", async () => {
-      const result = await notifyDesktop({ title: "", message: "" });
+    it("treats a leading tilde in a title as literal text", async () => {
+      const seen: string[] = [];
+      restore = setNotifyLauncher(async (_command, args) => {
+        seen.push(args.join(" "));
+        return { ok: true, stdout: SENTINEL, stderr: "" };
+      });
+
+      await notifyDesktop({ title: "~root", message: "~" });
+
+      expect(seen[0]).toContain("~root");
+    });
+  });
+
+  describe("real platform", () => {
+    it.skipIf(!runReal)("delivers on this machine", async () => {
+      const result = await notifyDesktop({ title: "agav", message: "workflow finished" });
       expect(typeof result.delivered).toBe("boolean");
     });
   });

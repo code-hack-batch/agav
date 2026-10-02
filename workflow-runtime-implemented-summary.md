@@ -542,6 +542,18 @@ Every path is best-effort and never throws: a machine with no notification daemo
 target shell, so a workflow name or error containing `;`, `$(…)`, or quotes is data, never a
 command line.
 
+### Exactly one notification per run
+
+Each platform script prints a sentinel once it has actually shown something, and that
+sentinel is the **sole** authority on success. The exit code is not: a Windows toast can
+appear and still leave a non-zero exit, and treating that as failure ran the fallback too,
+producing two banners for one run. A fallback now runs only when the previous mechanism
+reported nothing at all.
+
+At the run level, a finished run carries `notifiedAt`, so repeated polls — a background
+session plus a manual `agav workflows notifications` — still deliver exactly one message
+per run. Both properties are covered by tests.
+
 ```json
 {
   "desktopNotifications": true
@@ -851,7 +863,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
-| `source/__tests__/utils.desktop-notify.test.ts` | Notification formatting (title, urgency, error inclusion) and real platform delivery: definite result rather than throwing, empty notification, shell metacharacters, embedded quotes and newlines. |
+| `source/__tests__/utils.desktop-notify.test.ts` | Notification formatting (title, urgency, error inclusion); **single-shot delivery**: no fallback after a mechanism already showed one, fallback only when nothing was shown, undelivered when every mechanism fails, no throw when the launcher itself breaks; escaping passthrough. Uses an injected launcher, so no banner is popped during a test run. `AGAV_TEST_REAL_NOTIFY=1` runs one real-platform case. | Notification formatting (title, urgency, error inclusion) and real platform delivery: definite result rather than throwing, empty notification, shell metacharacters, embedded quotes and newlines. |
 | `source/__tests__/workflows.jobs.test.ts` | Job record round-trip, listing order, live/dead pid detection, orphan detection, finish marking, stop-request write/detect/clear, watcher single-fire and disposal, pruning policy, CLI formatting. |
 | `source/__tests__/workflows.notifications.test.ts` | `onComplete` firing once per terminal status, exclusion of `waiting_approval`, broken-hook and broken-sink isolation, once-only delivery, `notifiedAt` stamping, notification log, subscriber lifecycle. |
 | `source/__tests__/workflows.condition.test.ts` | Condition evaluation: truthiness, equality, ordering, input references, NaN rejection, and validator rejection of malformed conditions. |

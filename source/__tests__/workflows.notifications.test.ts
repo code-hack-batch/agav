@@ -251,4 +251,45 @@ describe("workflow completion notifications", () => {
     expect(delivered).toEqual([]);
     expect((await store.loadRun(gated.id))?.notifiedAt).toBeUndefined();
   });
-});
+
+  it("delivers exactly one notification per run across repeated refreshes", async () => {
+    // The reported symptom was several notifications for one finished workflow.
+    // Two independent causes are pinned here: the once-only stamp, and a single
+    // desktop call rather than a primary attempt plus a fallback.
+    const run = await runWorkflow(workflow(), {}, deps());
+
+    const desktop = vi.fn(async () => true);
+    const bell = vi.fn();
+
+    // Several polls, as a background session and a manual command would both do.
+    for (let i = 0; i < 4; i++) {
+      await refreshWorkflowRunNotifications(store, [desktop, bell]);
+    }
+
+    expect(desktop).toHaveBeenCalledTimes(1);
+    expect(bell).toHaveBeenCalledTimes(1);
+
+    // And the durable log agrees: one line, for this run.
+    const log = await readNotifications();
+    expect(log.filter((line) => line.includes(run.id))).toHaveLength(1);
+  });
+
+  it("delivers one notification per run when several finish", async () => {
+    const first = await runWorkflow(workflow(), {}, deps());
+    const second = await runWorkflow(workflow(), {}, deps());
+
+    const seen: string[] = [];
+    const desktop = vi.fn(async (event: { runId: string }) => {
+      seen.push(event.runId);
+      return true;
+    });
+    await refreshWorkflowRunNotifications(store, [desktop]);
+
+    // One each, not one for the batch and one for the first run.
+    expect(desktop).toHaveBeenCalledTimes(2);
+    expect(seen.sort()).toEqual([first.id, second.id].sort());
+
+    // A second pass adds nothing.
+    await refreshWorkflowRunNotifications(store, [desktop]);
+    expect(desktop).toHaveBeenCalledTimes(2);
+  });});
