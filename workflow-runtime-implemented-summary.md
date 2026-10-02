@@ -406,7 +406,69 @@ complete. The budget prevents *subsequent* work, not work in flight. That is a d
 consequence of not being able to interrupt a model call, and it is covered by a test so the
 boundary cannot drift silently.
 
-### Observability
+### Conditional branching (`when`)
+
+The runtime had no branching primitive: every node in a definition always ran, so a
+workflow could not route on what an agent decided. That is the one control-flow feature
+a multi-agent workflow cannot be built without.
+
+### Usage
+
+```yaml
+nodes:
+  - id: triage
+    type: agent
+    agent: classifier
+    task: Classify this issue
+    outputSchema:
+      type: object
+      required: [severity]
+      properties:
+        severity: { type: string }
+
+  - id: page_oncall
+    type: agent
+    agent: notifier
+    task: Page the on-call engineer
+    dependsOn: [triage]
+    when: '${nodes.triage.output.severity} == "high"'
+
+  - id: file_ticket
+    type: agent
+    agent: tracker
+    task: File a low-priority ticket
+    dependsOn: [triage]
+    when: '${nodes.triage.output.severity} != "high"'
+```
+
+### Supported expressions
+
+| Form | Example |
+| --- | --- |
+| Truthiness | `${nodes.gate.output.flag}` |
+| Equality / inequality | `${nodes.t.output.severity} == "high"` |
+| Ordering | `${nodes.scan.output.count} > 0`, `>=`, `<`, `<=` |
+| Run inputs | `${inputs.mode} == "prod"` |
+
+Deliberately not a general expression language. A dark factory routes on decisions, so
+the useful surface is small; anything more invites YAML that is hard to reason about when
+a run misbehaves. Numeric strings compare numerically, so `output.count` of `"3"` satisfies
+`> 0`. A non-numeric operand in an ordered comparison is not satisfied rather than silently
+comparing `NaN`.
+
+### Behavior
+
+- A node whose condition is false is checkpointed `skipped`, with `skippedReason` naming the
+  condition. The run records *why* work did not happen instead of leaving a gap;
+- the skip is durable, so a resume does not re-evaluate the branch;
+- a skipped dependency still unblocks its dependents. Otherwise a conditional branch would
+  deadlock the run;
+- a dependent with its own `when` is evaluated rather than auto-satisfied, so it can still
+  decide to run against a skipped upstream result;
+- conditions are validated before execution: a malformed condition such as `== "high"`,
+  which would interpolate to an empty left-hand side, fails the run up front instead of
+  silently skipping work.
+## Observability
 
 `computeRunMetrics` reports `tokenBudget` and `tokenBudgetExceeded`, and `formatMetrics`
 prints remaining headroom:
@@ -635,6 +697,8 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.condition.test.ts` | Condition evaluation: truthiness, equality, ordering, input references, NaN rejection, and validator rejection of malformed conditions. |
+| `source/__tests__/workflows.when.test.ts` | Conditional branching end to end: run/skip, skip recording, no deadlock on a skipped dependency, dependent re-evaluation, input conditions, durability across resume. |
 | `source/__tests__/workflows.shutdown.test.ts` | Run controller abort/reason/parent semantics, work tracking and grace-period drain, stop checkpointing, abandonment warning, resume with a fresh signal, refusal to resume a dead signal, fresh budget on resume. |
 | `source/__tests__/workflows.run-deadline.test.ts` | Run ceiling enforcement, in-flight node checkpointing, node-vs-run timeout attribution, loop bounding, resumability, unbounded/zero-limit behavior, metrics reporting. |
 | `source/__tests__/workflows.budget-display.test.ts` | Per-node budget rendering: reported budget, partial budget, no-budget highlight, measured counts, budget precedence, non-model nodes left blank. |

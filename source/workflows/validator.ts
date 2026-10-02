@@ -17,6 +17,16 @@ const SUPPORTED_NODE_TYPES = new Set([
   "loop",
 ]);
 
+/** Comparison operators a `when` condition may use. */
+const CONDITION_OPERATORS = ["==", "!=", ">=", "<=", ">", "<"];
+
+/**
+ * A condition containing an operator must have a non-empty left-hand operand.
+ * `${nodes.x.output.flag} == "high"` is well formed; `== "high"` is not, because
+ * the missing left side would interpolate to empty and silently compare wrong.
+ */
+const VALID_COMPARISON = /^\s*\S[^=<>!]*\s*(==|!=|>=|<=|>|<)\s*.+$/;
+
 export interface WorkflowValidationDeps {
   hasTool?: (name: string) => boolean;
   hasAgent?: (name: string) => boolean | Promise<boolean>;
@@ -96,6 +106,17 @@ async function validateNode(
 ): Promise<void> {
   if (!SUPPORTED_NODE_TYPES.has(node.type)) {
     issues.push({ path: `${path}.type`, message: `Unsupported node type: ${String(node.type)}` });
+  }
+
+  // A `when` condition is validated up front so a typo fails the run before any
+  // node executes, rather than silently skipping work mid-flight. Interpolated
+  // references cannot be resolved here, so only the operator is checked.
+  if (node.when !== undefined) {
+    if (typeof node.when !== "string" || node.when.trim() === "") {
+      issues.push({ path: `${path}.when`, message: "Node when condition must be a non-empty string" });
+    } else if (CONDITION_OPERATORS.some((op) => node.when!.includes(op)) && !VALID_COMPARISON.test(node.when!)) {
+      issues.push({ path: `${path}.when`, message: `Malformed when condition: ${node.when}` });
+    }
   }
 
   for (const dep of node.dependsOn ?? []) {

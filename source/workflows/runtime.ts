@@ -7,6 +7,7 @@ import type { LLMProvider } from "../providers/types.js";
 import { ToolRegistry } from "../tools/registry.js";
 import type { ToolResult } from "../tools/types.js";
 import { hashValue } from "./hash.js";
+import { evaluateCondition } from "./condition.js";
 import { interpolateString, interpolateValue } from "./interpolate.js";
 import { WorkflowStore } from "./store.js";
 import type {
@@ -249,6 +250,19 @@ async function executeWorkflowRun(
     await store.saveRun(run);
 
     await raceWithShutdown(Promise.all(batch.map(async (node) => {
+      // Evaluate `when` right before execution so the condition sees the output
+      // of whichever node it references, including one that just completed.
+      if (node.when !== undefined) {
+        const context = { inputs: run.inputs, nodes: await store.loadNodes(run.id) };
+        const condition = evaluateCondition(node.when, context);
+        if (!condition.ok) {
+          const skippedRun = conditionSkipped(node, deps, condition.reason ?? "false");
+          await store.saveNode(run.id, skippedRun);
+          skippedThisRun.add(node.id);
+          return;
+        }
+      }
+
       const result = await executeNode(run, node, deps, store, options, runDeadline, controller).catch(async (error: unknown) => {
         const attempt = await store.nextNodeAttempt(run.id, node.id);
         const failed = makeNodeRun(node, "failed", deps, { attempt, error: error instanceof Error ? error.message : String(error) });
@@ -341,7 +355,11 @@ function isReady(
   for (const depId of node.dependsOn ?? []) {
     const dep = nodeById.get(depId);
     const depCheckpoint = checkpoints[depId];
-    const satisfied = depCheckpoint?.status === "passed" || (dryRun && depCheckpoint?.status === "skipped");
+    // A dependency skipped by its own `when` (or by a dry run) still unblocks the
+  // next node. A dependent with no condition continues; one with its own `when`
+  // is admitted so the condition decides, rather than becoming a silent no-op.
+  const depSkipped = depCheckpoint?.status === "skipped";
+  const satisfied = depCheckpoint?.status === "passed" || depSkipped || dryRun;
     if (!satisfied) return false;
     if (dep && depCheckpoint?.nodeHash !== hashValue(dep)) return false;
   }
@@ -1491,6 +1509,21 @@ function normalizeMock(value: unknown): { input?: unknown; output: unknown } {
     return { input: record.input, output: record.output };
   }
   return { output: value };
+}
+
+/**
+ * Skip a node whose `when` condition evaluated false.
+ *
+ * Recorded as a normal `skipped` checkpoint rather than silently omitted, so a
+ * run shows why a branch did not execute and the decision survives a resume.
+ */
+function conditionSkipped(node: WorkflowNodeDefinition, deps: WorkflowRuntimeDeps, reason: string, attempt = 1): WorkflowNodeRun {
+  return makeNodeRun(node, "skipped", deps, {
+    attempt,
+    output: { skipped: true, condition: node.when, reason },
+    summary: `Skipped: ${node.when} was ${reason}`,
+    skippedReason: `Condition not met: ${node.when}`,
+  });
 }
 
 function drySkipped(node: WorkflowNodeDefinition, deps: WorkflowRuntimeDeps, input: unknown, reason: string, attempt = 1): WorkflowNodeRun {

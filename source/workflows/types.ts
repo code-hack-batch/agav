@@ -93,6 +93,21 @@ interface WorkflowNodeBase {
   retrySafe?: boolean;
   retryPolicy?: WorkflowRetryPolicy;
   idempotencyKey?: string;
+  /**
+   * Condition that must hold for this node to run.
+   *
+   * Supports `${...}` interpolation plus comparison, truthiness, and a small
+   * set of helpers. A node whose condition is false is checkpointed `skipped`
+   * with the reason, and its dependents are skipped with it, so a run records
+   * *why* work did not happen rather than leaving a gap.
+   *
+   * ```yaml
+   * when: ${nodes.triage.output.severity} == "high"
+   * when: ${inputs.dryRun} != true
+   * when: ${nodes.scan.output.count} > 0
+   * ```
+   */
+  when?: string;
 }
 
 export interface WorkflowAgentNode extends WorkflowNodeBase {
