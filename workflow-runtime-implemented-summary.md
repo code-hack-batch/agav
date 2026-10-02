@@ -468,6 +468,52 @@ comparing `NaN`.
 - conditions are validated before execution: a malformed condition such as `== "high"`,
   which would interpolate to an empty left-hand side, fails the run up front instead of
   silently skipping work.
+## Completion reporting for detached runs
+
+A scheduled run executes with no terminal attached, so its result has nowhere to appear
+unless something reports it. Mirrors the background-process record: a run carries
+`notifiedAt`, and delivery happens exactly once — on this poll if a session is live, or on a
+later session if it was not.
+
+### APIs
+
+```ts
+// runtime hook — fires once per terminal transition
+WorkflowRuntimeDeps.onComplete?: (run: WorkflowRun) => void
+
+// delivery — safe to call often; already-reported runs are skipped
+refreshWorkflowRunNotifications(store?, extraSinks?): Promise<WorkflowRunEvent[]>
+subscribeToWorkflowRunEvents(listener, { store?, extraSinks? }): () => void
+appendNotificationLog(event): Promise<void>
+readNotifications(limit?): Promise<string[]>
+clearNotifications(): Promise<void>
+stopWorkflowRunNotificationPolling(): void
+```
+
+| Concern | Behavior |
+| --- | --- |
+| Fires on | `passed`, `failed`, `cancelled`, `timed_out` |
+| Not fired on | `waiting_approval` — a paused run is not finished |
+| Delivery | Stamped `notifiedAt` *after* sinks run, so a throwing sink is retried rather than silently dropped |
+| Broken sink | Isolated: other sinks and the log still receive the event |
+| Broken hook | `onComplete` throwing cannot turn a successful run into a failed one |
+| Headless sink | `~/.agav/notifications.log`, always written, so a run on a machine with no UI still leaves a trail |
+
+Dependency-free by design: sinks are plain functions, so OS-level notification can be added
+without this module taking a dependency on it.
+
+## Headless execution
+
+`agav workflows run <workflow>` is fully self-contained — no TUI import — so it works as the
+body of a detached child process.
+
+The provider is resolved **lazily**. It was previously created eagerly, which made every
+headless run require credentials even when no node called a model; a tool-only, test-only, or
+approval-only workflow aborted on a missing API key. Resolution now happens on first `stream`,
+so the failure lands on the node that actually needs a model and carries that node's error.
+
+Covered by a CLI smoke test that runs a credential-free workflow with every provider key
+blanked.
 ## Observability
 
 `computeRunMetrics` reports `tokenBudget` and `tokenBudgetExceeded`, and `formatMetrics`
@@ -697,6 +743,7 @@ Remaining retry/idempotency work:
 | Test file | Coverage |
 | --- | --- |
 | `source/__tests__/workflows.parallel.test.ts` | Parallel fan-out, ordering, aggregation, failure, approval, resume, scoping validation, attempts. |
+| `source/__tests__/workflows.notifications.test.ts` | `onComplete` firing once per terminal status, exclusion of `waiting_approval`, broken-hook and broken-sink isolation, once-only delivery, `notifiedAt` stamping, notification log, subscriber lifecycle. |
 | `source/__tests__/workflows.condition.test.ts` | Condition evaluation: truthiness, equality, ordering, input references, NaN rejection, and validator rejection of malformed conditions. |
 | `source/__tests__/workflows.when.test.ts` | Conditional branching end to end: run/skip, skip recording, no deadlock on a skipped dependency, dependent re-evaluation, input conditions, durability across resume. |
 | `source/__tests__/workflows.shutdown.test.ts` | Run controller abort/reason/parent semantics, work tracking and grace-period drain, stop checkpointing, abandonment warning, resume with a fresh signal, refusal to resume a dead signal, fresh budget on resume. |

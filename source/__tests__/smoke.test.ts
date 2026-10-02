@@ -142,4 +142,46 @@ describe("Module imports", () => {
     const mod = await import("../providers/registry.js");
     expect(mod.createProvider).toBeTypeOf("function");
   });
-});
+  it("runs a credential-free workflow headlessly", async () => {
+    const { writeFile, mkdtemp, rm } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+
+    const dir = await mkdtemp(join(tmpdir(), "agav-headless-wf-"));
+    try {
+      const workflowPath = join(dir, "headless.yaml");
+      await writeFile(
+        workflowPath,
+        [
+          "version: 1",
+          "name: headless",
+          "description: no model calls",
+          "policies:",
+          "  sandbox: none",
+          "nodes:",
+          "  - id: gate",
+          "    type: approval",
+          "    prompt: Proceed?",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      // Blanking every provider key: a workflow with no model-calling node must
+      // not need credentials to run. This regressed when the CLI built its
+      // provider eagerly.
+      const result = await runCli(["workflows", "run", workflowPath], {
+        AGAV_CONFIG_DIR: join(dir, "agav"),
+        ANTHROPIC_API_KEY: "",
+        OPENAI_API_KEY: "",
+        GEMINI_API_KEY: "",
+        OPENROUTER_API_KEY: "",
+      });
+
+      expect(`${result.stdout}${result.stderr}`).not.toContain("API key not found");
+      expect(result.stdout).toContain("headless");
+      expect(result.exitCode).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });});

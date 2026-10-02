@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { createToolRegistry } from "../tools/registry-factory.js";
 import { loadConfig } from "../config/config.js";
 import { createProvider } from "../providers/registry.js";
+import type { LLMProvider, StreamParams } from "../providers/types.js";
 import { buildSystemPrompt } from "../utils/system-prompt.js";
 import { getAgent, loadAgents } from "../agents/loader.js";
 import { executeA2AAgentDetailed, executeNativeAgentDetailed } from "../agents/executor.js";
@@ -63,7 +64,20 @@ async function readInputs(args: string[]): Promise<Record<string, unknown>> {
 async function makeRuntimeDeps() {
   const config = await loadConfig();
   if (!config.systemPrompt) config.systemPrompt = await buildSystemPrompt();
-  const provider = createProvider(config);
+  // Lazy on purpose: a scheduled run often touches only tools, approvals, or
+  // tests. Eager creation made `workflows run` abort on a missing API key even
+  // when no node would have called a model.
+  let providerCache: LLMProvider | undefined;
+  const getProvider = (): LLMProvider => {
+    providerCache ??= createProvider(config);
+    return providerCache;
+  };
+  const provider: LLMProvider = {
+    get name() {
+      return config.provider;
+    },
+    stream: (streamParams: StreamParams) => getProvider().stream(streamParams),
+  };
   const toolRegistry = createToolRegistry();
   await loadAgents();
   return {
