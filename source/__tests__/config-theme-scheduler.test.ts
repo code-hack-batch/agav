@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../utils/fs.js", () => ({ ensureDir: vi.fn().mockResolvedValue(undefined) }));
-vi.mock("node:fs/promises", () => ({ readFile: vi.fn(), writeFile: vi.fn() }));
+vi.mock("node:fs/promises", () => ({
+  readFile: vi.fn(),
+  writeFile: vi.fn(),
+  // scheduler.saveTasks writes to a temp file and renames, matching the rest of
+  // the store. The rename is part of the contract under test.
+  rename: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock("node:crypto", () => ({ default: { randomUUID: () => "12345678-aaaa-bbbb-cccc-1234567890ab" } }));
 
 const fs = await import("node:fs/promises");
@@ -79,6 +85,14 @@ describe("scheduler process tasks", () => {
       cron: "0 9 * * *",
       enabled: true,
     });
-    expect(writeFile).toHaveBeenCalledWith(expect.stringContaining("scheduled-tasks.json"), expect.stringContaining('"kind": "process"'));
+    const rename = vi.mocked(fs.rename);
+    expect(rename).toHaveBeenCalledWith(expect.stringContaining(".tmp"), expect.stringContaining("scheduled-tasks.json"));
+    // The serialized content (including the new `kind` field) must land in the
+    // file that gets renamed into place. writeFile is called with a third
+    // encoding argument, so find the content-bearing call explicitly.
+    const writeCall = writeFile.mock.calls.find(
+      ([, content]) => String(content).includes('"kind": "process"'),
+    );
+    expect(writeCall).toBeDefined();
   });
 });

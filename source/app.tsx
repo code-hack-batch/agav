@@ -37,7 +37,7 @@ import { getClipboardText } from "./utils/clipboard-text.js";
 import { useClipboardImageDetector } from "./hooks/use-paste-handler.js";
 import { KeybindingResolver, GLOBAL_ACTIONS, formatKeybinding, formatKeybindings, normalizeKeyEvent, type Keybindings } from "./config/keybindings.js";
 import { getLoopStatus, stopActiveLoop } from "./commands/loop.js";
-import { loadScheduledTasks, cronMatches, markTaskRun } from "./config/scheduler.js";
+import { tick } from "./workflows/schedule-run.js";
 import { getSandboxName } from "./utils/sandbox.js";
 import { expandFileMentions } from "./utils/file-mentions.js";
 import { terminalRelativePaths } from "./utils/display-path.js";
@@ -495,39 +495,33 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
   }, [resumeMessages]);
 
   useEffect(() => {
+    // Delegate to the shared ticker so an interactive session and a headless
+    // `agav scheduler tick` apply identical rules. Only the minute granularity
+    // stays local: polling every 30s is cheap, and the decision layer already
+    // knows whether this minute was consumed.
     let lastCheckedMinute = -1;
-    const checker = setInterval(async () => {
+    const checker = setInterval(() => {
       const now = new Date();
       const currentMinute = now.getHours() * 60 + now.getMinutes();
       if (currentMinute === lastCheckedMinute) return;
       lastCheckedMinute = currentMinute;
-      try {
-        const tasks = await loadScheduledTasks();
-        for (const task of tasks) {
-          if (!task.enabled) continue;
-          if (cronMatches(task.cron, now)) {
-            await markTaskRun(task.id);
-            if (task.kind === "process") {
-              const result = await processTool.execute({
-                action: "start",
-                command: task.command ?? task.prompt,
-                cwd: task.cwd ?? process.cwd(),
-              });
-              addDisplayMessage({
-                id: `sys-${++sysMessageId}`,
-                role: "system",
-                content: `Scheduled background process "${task.name}" · cron ${task.cron}\n${result.output}`,
-                isError: result.isError,
-              });
-            } else {
-              submit(task.prompt, undefined, undefined, undefined, {
-                source: "schedule",
-                detail: `${task.name} · cron ${task.cron}`,
-              });
-            }
-          }
-        }
-      } catch {}
+      void tick({
+        now: () => now,
+        submitPrompt: (task) => {
+          submit(task.prompt, undefined, undefined, undefined, {
+            source: "schedule",
+            detail: `${task.name} · cron ${task.cron}`,
+          });
+        },
+        report: (message, isError) => {
+          addDisplayMessage({
+            id: `sys-${++sysMessageId}`,
+            role: "system",
+            content: message,
+            isError,
+          });
+        },
+      }).catch(() => {});
     }, 30_000);
     return () => clearInterval(checker);
   }, [addDisplayMessage, submit]);

@@ -1,7 +1,8 @@
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { rmSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { getAgavDir } from "../config/config.js";
 import { ensureDir } from "../utils/fs.js";
@@ -179,6 +180,14 @@ function childEnv(): Record<string, string> {
     if (/KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|AUTH/i.test(key)) continue;
     env[key] = value;
   }
+
+  // On Windows `process.env` is case-insensitive and enumerates as "Path",
+  // which a child does not recognise as the search path. Without the canonical
+  // spelling, anything the child resolves through PATH fails with ENOENT —
+  // including nvm's node shim.
+  const pathValue = env["PATH"] ?? env["Path"] ?? env["path"] ?? process.env["PATH"];
+  if (pathValue) env["PATH"] = pathValue;
+
   return env;
 }
 
@@ -220,8 +229,14 @@ export async function startWorkflowJob(options: StartWorkflowJobOptions): Promis
   };
   await writeJsonAtomic(jobPath(id), record);
 
-  const cliPath = options.cliPath ?? join(process.cwd(), "build", "cli.js");
+  // Absolute, and anchored to this module rather than the working directory: a
+  // scheduler or daemon may run from anywhere, and a relative path would spawn a
+  // child that cannot find the entry point.
+  const cliPath = options.cliPath
+    ? resolve(options.cliPath)
+    : fileURLToPath(new URL("../cli.js", import.meta.url));
   const args = [cliPath, "workflows", "run", options.target, "--run-id", options.runId];
+
   if (options.input && Object.keys(options.input).length > 0) {
     args.push("--input-json", JSON.stringify(options.input));
   }
@@ -239,9 +254,38 @@ export async function startWorkflowJob(options: StartWorkflowJobOptions): Promis
 
   child.unref();
 
-  const withPid: WorkflowJobRecord = { ...record, status: "running", pid: child.pid };
-  await writeJsonAtomic(jobPath(id), withPid);
-  return withPid;
+  // Without a listener, a failed spawn is an unhandled "error" event that
+  // terminates the process. A launcher that cannot start its child must record
+  // the failure, not die.
+  let spawnFailure: string | undefined;
+  child.on("error", (err) => { spawnFailure = err.message; });
+
+  // Give the spawn a moment to fail, so a launch error is recorded rather than
+  // leaving a job that claims to be running and never will be.
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    child.once("error", done);
+    child.once("spawn", done);
+    const timer = setTimeout(done, 500);
+    timer.unref?.();
+  });
+
+  const outcome: WorkflowJobRecord = {
+    ...record,
+    status: spawnFailure ? "finished" : "running",
+    ...(child.pid ? { pid: child.pid } : {}),
+    ...(spawnFailure
+      ? { finishedAt: new Date().toISOString(), error: `Failed to start: ${spawnFailure}` }
+      : {}),
+  };
+  await writeJsonAtomic(jobPath(id), outcome);
+  return { ...outcome };
 }
 
 /**

@@ -196,6 +196,18 @@ export function parseArgs(argv: string[]) {
       if (argv[i + 1] && !argv[i + 1]!.startsWith("-")) {
         flags.skillsCommand = argv[++i]!;
       }
+    } else if (arg === "scheduler" && i === 0) {
+      flags.scheduler = true;
+      if (argv[i + 1] && !argv[i + 1]!.startsWith("-")) {
+        flags.schedulerCommand = argv[++i]!;
+      }
+      // Subcommand flags belong to the subcommand: the dispatcher slices argv
+      // itself, so skip the rest of the parse rather than rejecting flags like
+      // --cron as unknown here.
+      if (flags.schedulerCommand) {
+        i = argv.length;
+        break;
+      }
     } else if (arg === "workflows" && i === 0) {
       flags.workflows = true;
       if (argv[i + 1] && !argv[i + 1]!.startsWith("-")) {
@@ -516,6 +528,17 @@ export async function main() {
       : (skillsCommand ? 4 : 3);
     const exitCode = await runSkillsCommand(skillsCommand, process.argv.slice(argsStartIndex));
     process.exit(exitCode);
+    return;
+  }
+
+  // Scheduling: agav scheduler <command>
+  if (flags.scheduler) {
+    const { runSchedulerCommand } = await import("./cli/scheduler-cli.js");
+    const schedulerCommand = typeof flags.schedulerCommand === "string" ? flags.schedulerCommand : undefined;
+    const schedulerIdx = process.argv.indexOf("scheduler");
+    const schedulerArgsStart = schedulerIdx >= 0 ? schedulerIdx + (schedulerCommand ? 2 : 1) : 2;
+    const schedulerExit = await runSchedulerCommand(schedulerCommand, process.argv.slice(schedulerArgsStart));
+    process.exit(schedulerExit);
     return;
   }
 
