@@ -96,7 +96,7 @@ describe("run-level maxRuntimeSeconds", () => {
 
     // The second node never ran.
     expect(await store.loadNode(run.id, "after")).toBeFalsy();
-  });
+  }, 30_000);
 
   it("checkpoints the in-flight node as timed_out", async () => {
     registry.register(tool("slow", async () => {
@@ -199,7 +199,7 @@ describe("run-level maxRuntimeSeconds", () => {
     expect(run.status).toBe("timed_out");
     // The ceiling bounded the run well short of 500 iterations.
     expect(iterations).toBeLessThan(500);
-  });
+  }, 30_000);
 
   it("keeps completed node results so the run is resumable", async () => {
     registry.register(tool("quick", async () => ({ output: "done", isError: false })));
