@@ -882,6 +882,11 @@ Remaining retry/idempotency work:
 | `source/__tests__/workflows.control.test.ts` | Run control, approval decisions, pending nodes, retry invalidation. |
 | `source/__tests__/commands.workflows.test.ts` | Slash command checkpoint formatting. |
 | `source/__tests__/workflows.runtime.test.ts` | Core runtime execution/resume. |
+| `source/__tests__/workflows.schedule-plan.test.ts` | Pure tick planning: cron matching, midnight wrap-around, day-anchored already-fired, catch-up window, skip recording, decision application. |
+| `source/__tests__/workflows.schedule-regressions.test.ts` | Bugs found in review: day boundary distinguishing two days at the same time-of-day, daily task due again the next day, malformed cron throwing instead of silently never firing, day stamped alongside the minute. |
+| `source/__tests__/workflows.jobs-finish.test.ts` | Child-side finish marker: marks this run id finished, refuses a foreign pid, marks a pid-less launch failure, no double-finish, leaves other runs untouched. |
+| `source/__tests__/workflows.schedule-orphan.test.ts` | Tick reconciles orphans before acting: fires a task whose only blocker was a stale record, still skips a genuinely live run, several orphans in one pass. |
+| `source/__tests__/config-theme-scheduler.test.ts` | Cron field parsing, malformed-expression rejection, task CRUD, enable/disable. |
 
 ## Verification
 
@@ -895,23 +900,23 @@ pnpm exec tsc --noEmit
 pnpm vitest run source/__tests__/workflows.attempts-cancellation.test.ts source/__tests__/workflows.dry-run-evals.test.ts source/__tests__/workflows.runtime.test.ts source/__tests__/workflows.control.test.ts source/__tests__/workflows.loader.test.ts source/__tests__/commands.workflows.test.ts
 ```
 
-## Recommended next two enhancements
+## Recommended next enhancements
 
-### 1. Workflow scheduling
+### 1. Standalone scheduler daemon
 
-```bash
-agav workflows schedule add <workflow> "0 9 * * 1-5"
-```
+The tick logic is complete and pure (`planTick`), but it only fires while a
+session is open, driven by the TUI's render loop. A daemon would fire schedules
+with no session attached. The pieces it needs already exist: detached jobs,
+orphan reconciliation, and notification reporting all work headlessly.
 
-Triggers a versioned workflow run rather than a raw prompt, with run history
-visible through the existing observability surface. Safe to build now that
-retry and crash recovery are hardened.
+### 2. Cost budget enforcement
 
-### 2. Token and cost budget enforcement
+`policies.costBudgetUsd` is still a no-op: converting tokens to money needs a
+per-model price table that does not exist yet. `tokenBudget` **is** enforced;
+this is the last declared policy with no effect.
 
-`WorkflowPolicies.tokenBudget` and `costBudgetUsd` are declared but never
-checked. Enforce them against the usage metrics the observability layer
-already computes, so a runaway agent node stops the run instead of silently
-overspending.
+### 3. Idempotency for native agent tools
 
-## Known gaps,,- `tokenBudget` / `costBudgetUsd` policies are declared but still not enforced. All,  in-process model-calling node types report usage, and runs are bounded by,  `maxRuntimeSeconds`, so both the accounting and a wall-clock ceiling are in place.,  External (A2A) agents are reported but cannot be enforced, because their consumption,  is not observable from here;,- cost estimation requires a per-model price table; only raw token counts are available,,  so `costBudgetUsd` cannot be enforced without one;,- a tool that ignores its `AbortSignal` still runs to completion in the background. The,  grace period bounds how long the run waits and the run exits cleanly, but the process,  does not kill the work. Background-process execution should terminate child processes,  rather than abandoning their promises;,- native agent tools do not receive an idempotency key. Workflow `tool` nodes and A2A,  agents do, but `source/agent/loop.ts` invokes tools without a context, so a retried,  native agent tool call is not deduplicated;,- metrics are computed on demand, not persisted or aggregated across runs;,- no scheduling. `agav workflows schedule add` is not implemented;
+`source/agent/loop.ts` invokes tools without a context, so a retried native agent
+tool call is not deduplicated. Workflow `tool` nodes and A2A agents already
+receive an idempotency key.
