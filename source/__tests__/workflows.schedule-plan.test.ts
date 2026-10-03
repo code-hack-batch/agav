@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   applyDecision,
   formatTaskStatus,
+  localDay,
   minutesSinceMidnight,
   planTick,
 } from "../workflows/schedule-plan.js";
@@ -41,7 +42,13 @@ describe("schedule planning", () => {
     });
 
     it("does not fire a task that already consumed this minute", () => {
-      const [decision] = planTick([task({ lastFiredMinute: 180 })], at(3, 0), () => false, always);
+      const now = at(3, 0);
+      const [decision] = planTick(
+        [task({ lastFiredMinute: 180, lastFiredDay: localDay(now) })],
+        now,
+        () => false,
+        always,
+      );
       expect(decision.fire).toBe(false);
       expect(decision.skip).toBe("already-fired");
     });
@@ -91,7 +98,13 @@ describe("schedule planning", () => {
     });
 
     it("does not count a miss when the task is up to date", () => {
-      const decisions = planTick([task({ lastFiredMinute: minutesSinceMidnight(at(3, 0)) })], at(3, 0), () => false, always);
+      const now = at(3, 0);
+      const decisions = planTick(
+        [task({ lastFiredMinute: minutesSinceMidnight(now), lastFiredDay: localDay(now) })],
+        now,
+        () => false,
+        always,
+      );
       expect(decisions[0].skip).toBe("already-fired");
     });
 
@@ -144,9 +157,12 @@ describe("schedule planning", () => {
     });
 
     it("returns the same object when nothing changed", () => {
-      const t = task({ lastFiredMinute: 180 });
-      const [decision] = planTick([t], at(3, 0), () => false, always);
-      expect(applyDecision(t, decision, at(3, 0))).toBe(t);
+      // The day is stamped alongside the minute, so an up-to-date task must record
+      // both to be recognized as consumed on this day rather than re-firing.
+      const now = at(3, 0);
+      const t = task({ lastFiredMinute: 180, lastFiredDay: localDay(now) });
+      const [decision] = planTick([t], now, () => false, always);
+      expect(applyDecision(t, decision, now)).toBe(t);
     });
 
     it("counts a missed run", () => {

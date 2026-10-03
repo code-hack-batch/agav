@@ -289,6 +289,31 @@ export async function startWorkflowJob(options: StartWorkflowJobOptions): Promis
 }
 
 /**
+ * Mark the job record for `runId` finished, from inside the child that ran it.
+ *
+ * The parent that spawned the run has usually exited by the time the run ends, so
+ * nobody else can close the record out — and a record left `running` makes the
+ * overlap guard block a scheduled task forever. Guarded by pid, so a later run
+ * reusing the same run id is never marked finished by an earlier child.
+ *
+ * Returns the record that was updated, or null when there was nothing to close.
+ */
+export async function markWorkflowJobFinishedByRunId(
+  runId: string,
+  outcome: { exitCode?: number | null; signal?: NodeJS.Signals | null; error?: string } = {},
+): Promise<WorkflowJobRecord | null> {
+  const jobs = await listWorkflowJobs();
+  const record = jobs.find(
+    (candidate) =>
+      candidate.runId === runId &&
+      candidate.status !== "finished" &&
+      (candidate.pid === undefined || candidate.pid === process.pid),
+  );
+  if (!record) return null;
+  return markWorkflowJobFinished(record.id, outcome);
+}
+
+/**
  * Stop a detached workflow run.
  *
  * Sends SIGTERM so the child can checkpoint cleanly. The workflow runtime traps

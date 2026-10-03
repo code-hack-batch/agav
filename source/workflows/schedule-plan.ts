@@ -33,6 +33,15 @@ export function minutesSinceMidnight(date: Date): number {
   return date.getHours() * 60 + date.getMinutes();
 }
 
+/** Local day the minute belongs to, as days since the epoch. */
+export function localDay(date: Date): number {
+  // Shift onto a timeline where local midnight is a day boundary, then count days.
+  // Without the shift a zone east of UTC maps local midnight into the previous UTC
+  // day, and two consecutive local days would compare equal.
+  return Math.floor((date.getTime() - date.getTimezoneOffset() * 60_000) / (24 * 60 * 60 * 1000));
+}
+
+
 /** Whether a minute is a given number of minutes after `from`, same day. */
 function isAfterMinute(minute: number, from: number): boolean {
   // `now` may have wrapped past midnight, so compare modulo a day.
@@ -65,9 +74,12 @@ export function planTick(
 
     const dueNow = matches(task.cron, now);
     const lastFired = task.lastFiredMinute;
+    const today = localDay(now);
 
-    // Already consumed this minute; nothing to do.
-    if (dueNow && lastFired !== undefined && lastFired === nowMinute) {
+    // Already consumed this minute, on this day. The day matters: a task fired at
+    // 03:00 yesterday is due again at 03:00 today, and comparing the minute alone
+    // silently skipped it for a whole day.
+    if (dueNow && lastFired !== undefined && lastFired === nowMinute && task.lastFiredDay === today) {
       decisions.push({ task, fire: false, skip: "already-fired" });
       continue;
     }
@@ -149,6 +161,7 @@ export function applyDecision(task: ScheduledTask, decision: TickDecision, now: 
       ...task,
       // Record the minute consumed, distinct from when the run started.
       lastFiredMinute: minutesSinceMidnight(now),
+    lastFiredDay: localDay(now),
       lastRunAt: stamp,
       missedRuns: 0,
       lastSkipReason: undefined,
@@ -164,7 +177,7 @@ export function applyDecision(task: ScheduledTask, decision: TickDecision, now: 
     missedRuns: decision.skip === "missed-outside-grace" ? (task.missedRuns ?? 0) + 1 : task.missedRuns,
     // A missed fire still consumes the minute, so the same gap is not counted on
     // every subsequent tick.
-    ...(decision.skip === "missed-outside-grace" ? { lastFiredMinute: minutesSinceMidnight(now) } : {}),
+    ...(decision.skip === "missed-outside-grace" ? { lastFiredMinute: minutesSinceMidnight(now), lastFiredDay: localDay(now) } : {}),
   };
 }
 

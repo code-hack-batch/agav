@@ -577,12 +577,23 @@ export async function main() {
       ? watchForStopRequest(watchedRunId, () => requestStop("stop request"))
       : () => {};
 
+    // The child outlives its parent, so it must close its own job record out. A
+    // record left `running` blocks the task's overlap guard forever, because the
+    // guard trusts the pid check and the pid gets reused on Windows.
+    const { markWorkflowJobFinishedByRunId } = await import("./workflows/jobs.js");
+
     try {
       const exitCode = await runWorkflowsCommand(workflowsCommand, process.argv.slice(argsStartIndex), {
         signal: stopController.signal,
       });
       stopWatching();
-      if (watchedRunId) clearStopRequest(watchedRunId);
+      if (watchedRunId) {
+      // Awaited rather than fire-and-forget: an exit handler would not complete
+      // before the process is gone, and a record left `running` blocks the task's
+      // overlap guard forever.
+      await markWorkflowJobFinishedByRunId(watchedRunId, {}).catch(() => {});
+      clearStopRequest(watchedRunId);
+      }
       process.exit(exitCode);
       return;
     } finally {

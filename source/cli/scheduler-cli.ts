@@ -3,6 +3,7 @@ import {
   addScheduledTask,
   addScheduledProcessTask,
   addScheduledWorkflowTask,
+  cronMatches,
   loadScheduledTasks,
   removeScheduledTask,
   setTaskEnabled,
@@ -109,6 +110,12 @@ export async function runSchedulerCommand(command: string | undefined, args: str
         return 1;
       }
       // Validate now rather than discovering a typo at 03:00.
+      try {
+      cronMatches(cron, new Date());
+      } catch (err) {
+        console.error(`Invalid cron expression: ${err instanceof Error ? err.message : String(err)}`);
+        return 1;
+      }
       const name = await requireRunnableWorkflow(target);
       const input = await readInput(args, 2);
       const catchUpWithinMinutes = intFlag(args, "--catch-up");

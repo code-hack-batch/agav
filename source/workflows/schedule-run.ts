@@ -79,7 +79,15 @@ export async function tick(deps: TickDeps = {}): Promise<TickDecision[]> {
 
   for (const decision of decisions) {
     if (decision.fire) {
-      await fire(decision, deps);
+      // Re-check liveness here rather than only before planTick. Two ticks in the
+      // same minute both read the task as idle otherwise, because the first has
+      // not yet spawned, and both fire — the overlap the guard exists to prevent.
+      const probe = deps.isTaskRunning ?? isWorkflowTaskRunning;
+      if (decision.task.skipIfRunning !== false && (await probe(decision.task))) {
+        deps.report?.(`Schedule "${decision.task.name}" skipped: previous run started moments ago`, true);
+      } else {
+        await fire(decision, deps);
+      }
     } else if (decision.skip && decision.skip !== "disabled" && decision.skip !== "already-fired") {
       // Never silent: a task that did not run says why.
       deps.report?.(`Schedule "${decision.task.name}" skipped: ${decision.skip}`, decision.skip !== "already-running");

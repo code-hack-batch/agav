@@ -28,6 +28,14 @@ export interface ScheduledTask {
    */
   lastFiredMinute?: number;
   /**
+   * Local day the consumed minute belonged to, as days since the epoch.
+   *
+   * `lastFiredMinute` is time-of-day only, so it cannot distinguish "fired this
+   * minute" from "fired at the same minute yesterday". Pairing it with the day
+   * keeps a daily task due again the next day instead of being skipped.
+   */
+  lastFiredDay?: number;
+  /**
    * Refuse to start a new run while the previous one is still going.
    *
    * Default true. Without it, a five-minute cron on a twenty-minute workflow
@@ -187,7 +195,9 @@ export async function markTaskRun(id: string): Promise<void> {
 
 export function cronMatches(cron: string, date: Date): boolean {
   const parts = cron.trim().split(/\s+/);
-  if (parts.length !== 5) return false;
+  if (parts.length !== 5) {
+    throw new Error(`Invalid cron expression "${cron}": expected 5 fields, got ${parts.length}`);
+  }
 
   const minute = date.getMinutes();
   const hour = date.getHours();

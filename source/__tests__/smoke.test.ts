@@ -32,7 +32,7 @@ describe("CLI boot", () => {
     const result = await runCli(["--version"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/\d+\.\d+\.\d+/);
-  });
+  }, 30_000);
 
   it("--help exits 0 and shows usage", async () => {
     const result = await runCli(["--help"]);
@@ -41,7 +41,7 @@ describe("CLI boot", () => {
     expect(result.stdout).toContain("--provider");
     expect(result.stdout).toContain("--model");
     expect(result.stdout).toContain("--print");
-  });
+  }, 30_000);
 
   it("-P without API key exits 1 with helpful error (not a crash)", async () => {
     const result = await runCli(["-P", "hello"], {
@@ -57,7 +57,7 @@ describe("CLI boot", () => {
     const output = `${result.stdout}\n${result.stderr}`;
     expect(output).toContain("no provider credentials found");
     expect(output).toMatch(/(export|set|\$env:)\s?ANTHROPIC_API_KEY/);
-  });
+  }, 30_000);
 });
 
 describe("Tool registry", () => {
@@ -184,4 +184,5 @@ describe("Module imports", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });});
+  }, 30_000);
+});

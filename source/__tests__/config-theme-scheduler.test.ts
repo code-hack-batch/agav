@@ -55,7 +55,9 @@ describe("scheduler cronMatches", () => {
     const { cronMatches } = await import("../config/scheduler.js");
     const date = new Date(2024, 0, 8, 10, 15, 0);
 
-    expect(cronMatches("* * * *", date)).toBe(false);
+    // A malformed expression throws rather than returning false, so a typo'd cron
+    // is rejected at `scheduler add` instead of silently never firing.
+    expect(() => cronMatches("* * * *", date)).toThrow();
     expect(cronMatches("61 * * * *", date)).toBe(false);
     expect(cronMatches("15 25 * * *", date)).toBe(false);
     expect(cronMatches("15 10 40 * *", date)).toBe(false);
