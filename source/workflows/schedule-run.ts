@@ -5,7 +5,7 @@ import {
   cronMatches,
   type ScheduledTask,
 } from "../config/scheduler.js";
-import { isWorkflowJobAlive, listWorkflowJobs, startWorkflowJob } from "./jobs.js";
+import { isWorkflowJobAlive, listWorkflowJobs, listOrphanedWorkflowJobs, markWorkflowJobFinished, startWorkflowJob } from "./jobs.js";
 import { applyDecision, formatTaskStatus, planTick, type TickDecision } from "./schedule-plan.js";
 
 /**
@@ -76,6 +76,27 @@ export async function tick(deps: TickDeps = {}): Promise<TickDecision[]> {
     if (await probe(task)) running.add(task.id);
   }
   const decisions = planTick(tasks, now, (task) => running.has(task.id), cronMatches);
+
+  // Reconcile orphans before acting. A job whose child died without closing its
+  // record out stays `running` forever, and the overlap guard trusts that record,
+  // so a scheduled task would be skipped on a run that is no longer going. This is
+  // what wedged a task into reporting "already running" every tick.
+  const orphans = await listOrphanedWorkflowJobs();
+  for (const orphan of orphans) {
+    await markWorkflowJobFinished(orphan.id, { error: "child exited without closing its job record" });
+  }
+  if (orphans.length > 0) {
+    // Re-probe and re-plan against the corrected liveness, so a task that was only
+    // stuck because of a stale record gets to fire this tick rather than waiting a
+    // whole minute for the next one.
+    running.clear();
+    for (const task of tasks) {
+      if (await probe(task)) running.add(task.id);
+    }
+    const corrected = planTick(tasks, now, (task) => running.has(task.id), cronMatches);
+    decisions.length = 0;
+    decisions.push(...corrected);
+  }
 
   for (const decision of decisions) {
     if (decision.fire) {

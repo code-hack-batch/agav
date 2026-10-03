@@ -10,7 +10,10 @@ async function runCli(args: string[], env?: NodeJS.ProcessEnv) {
   const cliPath = resolve("build/cli.js");
   return new Promise<{ stdout: string; stderr: string; exitCode: number }>((resolvePromise) => {
     execFile(process.execPath, [cliPath, ...args], {
-      timeout: 10000,
+      // 30s: the CLI takes 1-2.5s on Windows but more under parallel load, and a
+      // 10s cap turned a slow spawn into a reported exit code of 1 rather than a
+      // timeout, which read as a boot failure instead of a slow machine.
+      timeout: 30000,
       cwd: tmpdir(),
       env: env ? { ...process.env, ...env } : process.env,
     }, (err, stdout, stderr) => {
