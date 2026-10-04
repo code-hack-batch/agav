@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getAgavDir } from "../config/config.js";
-import { tick, type TickDecision, type TickDeps } from "./schedule-run.js";
+import { tick, type TickDeps } from "./schedule-run.js";
+import type { TickDecision } from "./schedule-plan.js";
 
 /**
  * A headless scheduler that runs without an interactive session.
