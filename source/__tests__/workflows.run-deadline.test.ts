@@ -224,18 +224,20 @@ describe("run-level maxRuntimeSeconds", () => {
 
   it("surfaces the ceiling and overrun in run metrics", async () => {
     registry.register(tool("slow", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Far longer than the ceiling, so the overrun is unambiguous regardless of
+      // scheduling or machine load.
+      await new Promise((resolve) => setTimeout(resolve, 5000));
       return { output: "done", isError: false };
     }));
 
     const run = await runWorkflow(workflow([
       { id: "slow", type: "tool", tool: "slow" },
-    ], { maxRuntimeSeconds: 0.05 }), {}, { provider, config, toolRegistry: registry, loadAgent, executeAgent, store });
+    ], { maxRuntimeSeconds: 0.5 }), {}, { provider, config, toolRegistry: registry, loadAgent, executeAgent, store });
 
     const summary = await store.getRunSummary(run.id);
     const metrics = computeRunMetrics(summary!);
 
-    expect(metrics.maxRuntimeSeconds).toBe(0.05);
+    expect(metrics.maxRuntimeSeconds).toBe(0.5);
     expect(metrics.runtimeExceeded).toBe(true);
     expect(metrics.timedOutNodes).toBe(1);
 
