@@ -221,6 +221,13 @@ describe("permission gate: destructive flag trust", () => {
 
     expect(processTool.execute).toHaveBeenCalledTimes(2);
     expect(confirmTool).toHaveBeenCalledTimes(1);
-    expect(confirmTool).toHaveBeenCalledWith("process", { action: "start", command: "npm run dev" }, undefined);
+    // A fourth argument carries the MCP server name, which is undefined for a
+    // built-in tool such as process.
+    expect(confirmTool).toHaveBeenCalledWith(
+      "process",
+      { action: "start", command: "npm run dev" },
+      undefined,
+      undefined,
+    );
   });
 });
