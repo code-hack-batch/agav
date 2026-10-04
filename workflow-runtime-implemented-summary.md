@@ -900,6 +900,46 @@ pnpm exec tsc --noEmit
 pnpm vitest run source/__tests__/workflows.attempts-cancellation.test.ts source/__tests__/workflows.dry-run-evals.test.ts source/__tests__/workflows.runtime.test.ts source/__tests__/workflows.control.test.ts source/__tests__/workflows.loader.test.ts source/__tests__/commands.workflows.test.ts
 ```
 
+## Workflow scheduling
+
+A scheduled task fires a **workflow run** rather than a raw prompt, so a scheduled
+job gets the same checkpoints, retries, budgets, and observability as any other run.
+
+```bash
+agav scheduler list                           # tasks and their last outcome
+agav scheduler add "0 9 * * 1-5" <workflow>   # schedule a workflow
+agav scheduler tick                           # evaluate once, start anything due
+agav scheduler remove <id>
+agav scheduler enable <id> | disable <id>
+```
+
+### Pure tick planning
+
+`planTick` is pure: it takes the tasks, a clock reading, and two predicates, and
+returns decisions. No I/O, so every rule below is unit-tested directly.
+
+| Rule | Behavior |
+| --- | --- |
+| Cron matching | A malformed expression throws at `add` time rather than silently never firing. |
+| Day anchoring | A fire is recorded per local day, so a daily task is due again the next day instead of comparing a bare minute-of-day. |
+| Midnight wrap | A task last fired at 23:59 is due at 00:00 the next day. |
+| Catch-up | A fire missed while nothing was running is recovered inside the catch-up window, or recorded outside it. Never silent. |
+| Overlap guard | A task whose previous run is still in flight is skipped unless `skipIfRunning: false`. |
+
+### Overlapping runs
+
+A five-minute cron against a twenty-minute workflow would otherwise start four
+concurrent runs against the same external systems. The guard is checked again inside
+the fire path, not only during planning, so two ticks in the same minute cannot both
+start a run.
+
+### Orphan reconciliation
+
+A job record whose child died without closing it out stays `running` forever, and the
+overlap guard trusts that record — which wedges a task into reporting
+"previous run still in flight" every tick. The tick reconciles orphaned records
+before acting, and re-plans against the corrected state, so a task blocked only by a
+stale record fires that tick rather than waiting a full minute.
 ## Recommended next enhancements
 
 ### 1. Standalone scheduler daemon
