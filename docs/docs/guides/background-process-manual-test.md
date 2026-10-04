@@ -6,7 +6,7 @@ navHidden: true
 
 # Background Process Manual Test Plan
 
-Use this checklist when validating daemon-backed background processes on `feat/background-process-tool`. Run it in a disposable repository or folder.
+Use this checklist when validating daemon-backed background processes on `feat/background-process-tool-v3`. Run it in a disposable repository or folder.
 
 ## Feature summary
 
@@ -30,7 +30,7 @@ Expected persistence behavior:
 
 ## Preconditions
 
-1. Check out and build or run Agav from `feat/background-process-tool`.
+1. Check out and build or run Agav from `feat/background-process-tool-v3`.
 2. Start Agav in a test repository or disposable folder.
 3. Ensure `node` is available for the `node -e` examples.
 4. If a packaged runtime cannot launch the daemon runner, start Agav with:
