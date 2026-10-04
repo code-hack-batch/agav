@@ -168,7 +168,10 @@ describe("workflow runtime", () => {
     };
     registry.register(tool);
 
-    const workflow = baseWorkflow([{ id: "flaky_node", type: "tool", tool: "flaky" }]);
+    // retrySafe opts this node into an automatic retry on resume. Without it the
+    // runtime correctly requires approval to retry an interrupted tool node, and
+    // the run would stop at waiting_approval rather than recovering as tested.
+    const workflow = baseWorkflow([{ id: "flaky_node", type: "tool", tool: "flaky", retrySafe: true }]);
     const failed = await runWorkflow(workflow, {}, { provider, config, toolRegistry: registry, loadAgent, executeAgent, store });
     expect(failed.status).toBe("failed");
 
