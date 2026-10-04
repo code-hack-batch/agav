@@ -185,7 +185,7 @@ describe("run-level maxRuntimeSeconds", () => {
         // Wake on abort as well as on the timer, so the tool stops promptly
         // instead of finishing in the background after the run has returned.
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, 15);
+          const timer = setTimeout(resolve, 40);
           signal?.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
         });
         return { output: "tick", isError: false };
@@ -194,7 +194,7 @@ describe("run-level maxRuntimeSeconds", () => {
 
     const run = await runWorkflow(workflow([
       { id: "loop", type: "loop", maxIterations: 500, body: [{ id: "tick", type: "tool", tool: "tick" }] },
-    ], { maxRuntimeSeconds: 0.08 }), {}, { provider, config, toolRegistry: registry, loadAgent, executeAgent, store });
+    ], { maxRuntimeSeconds: 2 }), {}, { provider, config, toolRegistry: registry, loadAgent, executeAgent, store });
 
     expect(run.status).toBe("timed_out");
     // The ceiling bounded the run well short of 500 iterations.
