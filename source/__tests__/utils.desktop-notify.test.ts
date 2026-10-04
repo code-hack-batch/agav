@@ -1,10 +1,21 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   formatDesktopNotification,
   notifyDesktop,
   setNotifyLauncher,
   type CommandResult,
 } from "../utils/desktop-notify.js";
+
+/**
+ * notifyDesktop dispatches on the host platform, so the mechanism-chain cases
+ * below describe Windows specifically. Pin the platform so those assertions mean
+ * the same thing on every machine rather than only where the suite happens to run —
+ * on Linux they otherwise exercise notifyLinux and the Windows stubs never apply.
+ */
+vi.mock("node:os", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:os")>()),
+  platform: () => "win32",
+}));
 
 /**
  * Delivery is exercised through an injected launcher rather than a real one.
