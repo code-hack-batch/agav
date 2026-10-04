@@ -14,6 +14,7 @@ import { loadWorkflow } from "../workflows/loader.js";
 import { validateWorkflow } from "../workflows/validator.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { listWorkflowJobs, isWorkflowJobAlive } from "../workflows/jobs.js";
+import { daemonPaths, readDaemonRecord, runDaemon, stopDaemon } from "../workflows/scheduler-daemon.js";
 
 /**
  * `agav scheduler <command>`
@@ -31,9 +32,15 @@ function printUsage(): void {
   tick                          Evaluate the schedule once, starting anything due
   remove <id>                   Remove a scheduled task
   enable <id> / disable <id>    Toggle a scheduled task
+  daemon start                  Run the scheduler with no interactive session
+  daemon stop                   Stop a running scheduler daemon
+  daemon status                 Report whether a daemon is running
 
 Workflow scheduling runs detached: the workflow keeps going after the terminal
-that started it closes, and reports on completion through agav notifications.`);
+that started it closes, and reports on completion through agav notifications.
+
+Without a daemon the schedule only fires while an interactive session is open.
+Run \`agav scheduler daemon start\` to evaluate every 30s with no session attached.`);
 }
 
 /** Take the next argument, treating a leading dash as a missing value. */
@@ -111,7 +118,7 @@ export async function runSchedulerCommand(command: string | undefined, args: str
       }
       // Validate now rather than discovering a typo at 03:00.
       try {
-      cronMatches(cron, new Date());
+        cronMatches(cron, new Date());
       } catch (err) {
         console.error(`Invalid cron expression: ${err instanceof Error ? err.message : String(err)}`);
         return 1;
@@ -165,6 +172,45 @@ export async function runSchedulerCommand(command: string | undefined, args: str
       return ok ? (console.log(`${command}d ${id}.`), 0) : (console.error(`No task matching ${id}.`), 1);
     }
 
+    if (command === "daemon") {
+      const action = take(args, 0);
+
+      if (action === "start") {
+        const paths = daemonPaths();
+        // Report an existing daemon plainly rather than starting a second one.
+        const existing = await readDaemonRecord(paths);
+        if (existing) {
+          console.log(`Scheduler daemon already running (pid ${existing.pid}, since ${existing.startedAt}).`);
+          return 0;
+        }
+        console.log("Starting scheduler daemon. Press Ctrl+C to stop.");
+        // Blocks until stopped, so the daemon stays the foreground process.
+        await runDaemon({ paths });
+        return 0;
+      }
+
+      if (action === "stop") {
+        const stopped = await stopDaemon(daemonPaths());
+        return stopped
+          ? (console.log(`Signalled scheduler daemon (pid ${stopped.pid}).`), 0)
+          : (console.log("No scheduler daemon is running."), 0);
+      }
+
+      if (action === "status") {
+        const record = await readDaemonRecord(daemonPaths());
+        if (!record) {
+          console.log("Scheduler daemon: not running.");
+          console.log("  Schedules fire while an interactive session is open, or while a daemon runs.");
+          return 0;
+        }
+        console.log(`Scheduler daemon: running (pid ${record.pid}).`);
+        console.log(`  Started ${record.startedAt}`);
+        return 0;
+      }
+
+      printUsage();
+      return 1;
+    }
     printUsage();
     return 1;
   } catch (err) {

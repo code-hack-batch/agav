@@ -159,3 +159,5 @@ export function formatScheduleLine(task: ScheduledTask): string {
   const state = task.enabled ? "" : " [disabled]";
   return `${task.id}  [${kind}]  ${task.name}  ${task.cron}  ${target}${state}\n      ${formatTaskStatus(task)}`;
 }
+
+export type { TickDecision } from "./schedule-plan.js";
